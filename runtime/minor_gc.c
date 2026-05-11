@@ -37,6 +37,7 @@
 #include "caml/mlvalues.h"
 #include "caml/platform.h"
 #include "caml/roots.h"
+#include "caml/dax_arena.h"
 #include "caml/shared_heap.h"
 #include "caml/signals.h"
 #include "caml/startup_aux.h"
@@ -149,11 +150,21 @@ struct oldify_state {
   caml_domain_state* domain;
 };
 
+/* Week-4 arena selection: route all promotions to ARENA_FAR when
+ * OCAML_FAR_ALL=1, otherwise always use ARENA_DRAM.  The reserved bits
+ * (criticality hints) arrive in Week 5; the signature is already pinned. */
+static caml_arena_id choose_arena_week4(reserved_t reserved) {
+  (void)reserved; /* hint plumbing arrives in Week 5 */
+  if (caml_far_all_promotions) return ARENA_FAR;
+  return ARENA_DRAM;
+}
+
 static value alloc_shared(caml_domain_state* d,
-                          mlsize_t wosize, tag_t tag, reserved_t reserved)
+                          mlsize_t wosize, tag_t tag, reserved_t reserved,
+                          caml_arena_id arena)
 {
-  void* mem = caml_shared_try_alloc(d->shared_heap, wosize, tag,
-                                    reserved);
+  void* mem = caml_shared_try_alloc_arena(d->shared_heap, wosize, tag,
+                                          reserved, arena);
   caml_update_major_allocated_words(
     d, Whsize_wosize(wosize), 0 /* promoted, not direct */);
   if (mem == NULL) {
@@ -271,7 +282,8 @@ static void oldify_one (void* st_v, value v, volatile value *p)
     value stack_value = Field(v, 0);
     CAMLassert(Wosize_hd(hd) == 1);
     CAMLassert(infix_offset == 0);
-    result = alloc_shared(st->domain, 1, Cont_tag, Reserved_hd(hd));
+    result = alloc_shared(st->domain, 1, Cont_tag, Reserved_hd(hd),
+                          choose_arena_week4(Reserved_hd(hd)));
     if( try_update_object_header(v, p, result, 0) ) {
       struct stack_info* stk = Ptr_val(stack_value);
       Field(result, 0) = stack_value;
@@ -293,7 +305,8 @@ static void oldify_one (void* st_v, value v, volatile value *p)
     value field0;
     sz = Wosize_hd (hd);
     st->live_bytes += Bhsize_hd(hd);
-    result = alloc_shared(st->domain, sz, tag, Reserved_hd(hd));
+    result = alloc_shared(st->domain, sz, tag, Reserved_hd(hd),
+                          choose_arena_week4(Reserved_hd(hd)));
     field0 = Field(v, 0);
     if (tag == Closure_tag) {
       /* We must copy all infix tags before updating the object
@@ -339,7 +352,8 @@ static void oldify_one (void* st_v, value v, volatile value *p)
   } else if (!Scannable_tag(tag)) {
     sz = Wosize_hd (hd);
     st->live_bytes += Bhsize_hd(hd);
-    result = alloc_shared(st->domain, sz, tag, Reserved_hd(hd));
+    result = alloc_shared(st->domain, sz, tag, Reserved_hd(hd),
+                          choose_arena_week4(Reserved_hd(hd)));
     for (mlsize_t i = 0; i < sz; i++) {
       Field(result, i) = Field(v, i);
     }
@@ -372,7 +386,8 @@ static void oldify_one (void* st_v, value v, volatile value *p)
       /* Do not short-circuit the pointer.  Copy as a normal block. */
       CAMLassert (Wosize_hd (hd) == 1);
       st->live_bytes += Bhsize_hd(hd);
-      result = alloc_shared(st->domain, 1, Forward_tag, Reserved_hd(hd));
+      result = alloc_shared(st->domain, 1, Forward_tag, Reserved_hd(hd),
+                            choose_arena_week4(Reserved_hd(hd)));
       if( try_update_object_header(v, p, result, 0) ) {
         p = Op_val (result);
         v = f;

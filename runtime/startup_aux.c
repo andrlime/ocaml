@@ -25,6 +25,7 @@
 #endif
 #include <string.h>
 #include "caml/backtrace.h"
+#include "caml/dax_arena.h"
 #include "caml/memory.h"
 #include "caml/callback.h"
 #include "caml/domain.h"
@@ -49,6 +50,8 @@ extern void caml_win32_unregister_overflow_detection (void);
 
 static struct caml_params params;
 const struct caml_params* const caml_params = &params;
+
+int caml_far_all_promotions = 0;
 
 static void init_startup_params(void)
 {
@@ -161,6 +164,21 @@ void caml_parse_ocamlrunparam(void)
   }
 
   caml_stat_free(opt_tofree);
+
+  /* Tiered-major-heap: initialise DAX arena and read OCAML_FAR_ALL. */
+  caml_dax_arena_init();
+  {
+    const char* far_all = getenv("OCAML_FAR_ALL");
+    if (far_all != NULL && *far_all != '\0' && *far_all != '0') {
+      if (!caml_dax_arena_available()) {
+        fprintf(stderr,
+                "[ocaml] OCAML_FAR_ALL=1 requested but DAX arena is "
+                "unavailable; all promotions will use DRAM\n");
+      } else {
+        caml_far_all_promotions = 1;
+      }
+    }
+  }
 
   /* Validate */
   if (params.max_domains < 1) {

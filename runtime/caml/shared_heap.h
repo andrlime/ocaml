@@ -28,6 +28,15 @@
 
 CAMLextern atomic_uintnat caml_compactions_count;
 
+/* Major-heap arenas. ARENA_DRAM is the default, anonymous-mmap-backed arena
+ * managed by caml_mem_map. ARENA_FAR is backed by a devdax device (see
+ * runtime/dax_arena.c) and used for the tiered-major-heap experiments. */
+typedef enum {
+  ARENA_DRAM = 0,
+  ARENA_FAR  = 1,
+  NUM_ARENAS = 2
+} caml_arena_id;
+
 struct caml_heap_state;
 struct pool;
 
@@ -44,6 +53,14 @@ void caml_free_shared_heap(struct caml_heap_state* heap);
 
 value* caml_shared_try_alloc(struct caml_heap_state*,
                              mlsize_t, tag_t, reserved_t);
+
+/* Like caml_shared_try_alloc, but routes the allocation to the named arena.
+ * Returns NULL if the requested arena is unavailable (e.g. ARENA_FAR on a
+ * host without /dev/dax2.0); callers that must succeed should fall back to
+ * caml_shared_try_alloc. */
+value* caml_shared_try_alloc_arena(struct caml_heap_state*,
+                                   mlsize_t, tag_t, reserved_t,
+                                   caml_arena_id);
 
 /* Copy the domain-local heap stats into a heap stats sample. */
 void caml_collect_heap_stats_sample(

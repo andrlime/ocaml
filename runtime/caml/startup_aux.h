@@ -62,6 +62,12 @@ struct caml_params {
 
 extern const struct caml_params* const caml_params;
 
+/* Set to 1 when OCAML_FAR_ALL=1 is in the environment.  When set, all
+ * minor-GC promotions are routed to the FAR (devdax) arena.  This is a
+ * Week-4 smoke-test hook; real criticality-aware placement arrives in Week 5.
+ */
+extern int caml_far_all_promotions;
+
 extern void caml_parse_ocamlrunparam (void);
 
 /* Common entry point to caml_startup.

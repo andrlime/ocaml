@@ -20,6 +20,7 @@
 #include <string.h>
 #include "caml/addrmap.h"
 #include "caml/custom.h"
+#include "caml/dax_arena.h"
 #include "caml/runtime_events.h"
 #include "caml/fail.h"
 #include "caml/fiber.h" /* for verification */
@@ -50,6 +51,11 @@ typedef struct pool {
   value* next_obj;
   caml_domain_state* owner;
   sizeclass sz;
+  /* arena field is read by pool_release / pool_free to route the pool back
+   * to the correct freelist (and to skip caml_mem_unmap for far-arena pools,
+   * which are owned by the DAX allocator). 1 byte fits in existing padding;
+   * sizeof(pool) is unchanged. */
+  unsigned char arena;
 } pool;
 static_assert(sizeof(pool) == Bsize_wsize(POOL_HEADER_WSIZE), "");
 #define POOL_SLAB_WOFFSET(sz) (POOL_HEADER_WSIZE + padding_sizeclass[sz])
@@ -65,11 +71,14 @@ static_assert(sizeof(pool) == Bsize_wsize(POOL_HEADER_WSIZE), "");
 typedef struct large_alloc {
   caml_domain_state* owner;
   struct large_alloc* next;
+  /* See note on `pool::arena`. The full uintnat keeps sizeof a multiple of
+   * sizeof(value); we have plenty of slack since this is per-large-block. */
+  uintnat arena;
 } large_alloc;
 static_assert(sizeof(large_alloc) % sizeof(value) == 0, "");
 #define LARGE_ALLOC_HEADER_SZ sizeof(large_alloc)
 
-static struct {
+struct pool_freelist_state {
   caml_plat_mutex lock;
   pool* free;
 
@@ -78,25 +87,46 @@ static struct {
   _Atomic(pool*) global_avail_pools[NUM_SIZECLASSES];
   _Atomic(pool*) global_full_pools[NUM_SIZECLASSES];
   large_alloc* global_large;
-} pool_freelist = {
-  CAML_PLAT_MUTEX_INITIALIZER,
-  NULL,
-  { 0, },
-  { NULL, },
-  { NULL, },
-  NULL
 };
+
+static struct pool_freelist_state pool_freelists[NUM_ARENAS] = {
+  [ARENA_DRAM] = {
+    CAML_PLAT_MUTEX_INITIALIZER,
+    NULL,
+    { 0, },
+    { NULL, },
+    { NULL, },
+    NULL,
+  },
+  [ARENA_FAR] = {
+    CAML_PLAT_MUTEX_INITIALIZER,
+    NULL,
+    { 0, },
+    { NULL, },
+    { NULL, },
+    NULL,
+  },
+};
+
+/* The DRAM freelist is the historical singleton; keep an alias so existing
+ * call sites that don't care about arenas don't grow noisy. */
+#define pool_freelist (pool_freelists[ARENA_DRAM])
 
 /* readable and writable only by the current thread */
 struct caml_heap_state {
-  pool* avail_pools[NUM_SIZECLASSES];
-  pool* full_pools[NUM_SIZECLASSES];
-  pool* unswept_avail_pools[NUM_SIZECLASSES];
-  pool* unswept_full_pools[NUM_SIZECLASSES];
+  /* Per-arena pool / large-alloc state. Index 0 is the DRAM (caml_mem_map)
+   * arena; index 1 is the DAX-backed far-memory arena. */
+  pool* avail_pools[NUM_ARENAS][NUM_SIZECLASSES];
+  pool* full_pools[NUM_ARENAS][NUM_SIZECLASSES];
+  pool* unswept_avail_pools[NUM_ARENAS][NUM_SIZECLASSES];
+  pool* unswept_full_pools[NUM_ARENAS][NUM_SIZECLASSES];
 
-  large_alloc* swept_large;
-  large_alloc* unswept_large;
+  large_alloc* swept_large[NUM_ARENAS];
+  large_alloc* unswept_large[NUM_ARENAS];
 
+  /* Sweep cursor. We sweep DRAM first, then FAR; per-arena cursor avoids
+   * a wider type. Reset to (ARENA_DRAM, 0) on caml_cycle_heap. */
+  caml_arena_id next_arena_to_sweep;
   sizeclass next_to_sweep;
 
   caml_domain_state* owner;
@@ -116,13 +146,16 @@ struct caml_heap_state* caml_init_shared_heap (void) {
 
   heap = caml_stat_alloc_noexc(sizeof(struct caml_heap_state));
   if(heap != NULL) {
-    for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
-      heap->avail_pools[i] = heap->full_pools[i] =
-        heap->unswept_avail_pools[i] = heap->unswept_full_pools[i] = 0;
+    for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+      for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
+        heap->avail_pools[a][i] = heap->full_pools[a][i] =
+          heap->unswept_avail_pools[a][i] = heap->unswept_full_pools[a][i] = 0;
+      }
+      heap->swept_large[a] = NULL;
+      heap->unswept_large[a] = NULL;
     }
+    heap->next_arena_to_sweep = ARENA_DRAM;
     heap->next_to_sweep = 0;
-    heap->swept_large = NULL;
-    heap->unswept_large = NULL;
     heap->owner = Caml_state;
 
     memset(&heap->stats, 0, sizeof(heap->stats));
@@ -147,74 +180,89 @@ static int move_all_pools(pool** src, _Atomic(pool*)* dst,
 void caml_orphan_shared_heap(struct caml_heap_state* heap) {
   int released = 0, released_large = 0;
 
+  for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+    struct pool_freelist_state* fl = &pool_freelists[a];
+    caml_plat_lock_blocking(&fl->lock);
+    for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
+      released +=
+        move_all_pools(&heap->avail_pools[a][i],
+                       &fl->global_avail_pools[i], NULL);
+
+      released +=
+        move_all_pools(&heap->full_pools[a][i],
+                       &fl->global_full_pools[i], NULL);
+
+      /* should be swept by now */
+      CAMLassert(!heap->unswept_avail_pools[a][i]);
+      CAMLassert(!heap->unswept_full_pools[a][i]);
+    }
+    CAMLassert(!heap->unswept_large[a]);
+    while (heap->swept_large[a]) {
+      large_alloc* la = heap->swept_large[a];
+      heap->swept_large[a] = la->next;
+      la->next = fl->global_large;
+      fl->global_large = la;
+      released_large++;
+    }
+    caml_plat_unlock(&fl->lock);
+  }
+
+  /* Heap stats are aggregated, not per-arena, so accumulate them once into
+   * the DRAM freelist's stats slot (a Week-4 simplification). */
   caml_plat_lock_blocking(&pool_freelist.lock);
-  for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
-    released +=
-      move_all_pools(&heap->avail_pools[i],
-                     &pool_freelist.global_avail_pools[i], NULL);
-
-    released +=
-      move_all_pools(&heap->full_pools[i],
-                     &pool_freelist.global_full_pools[i], NULL);
-
-    /* should be swept by now */
-    CAMLassert(!heap->unswept_avail_pools[i]);
-    CAMLassert(!heap->unswept_full_pools[i]);
-  }
-  CAMLassert(!heap->unswept_large);
-  while (heap->swept_large) {
-    large_alloc* a = heap->swept_large;
-    heap->swept_large = a->next;
-    a->next = pool_freelist.global_large;
-    pool_freelist.global_large = a;
-    released_large++;
-  }
   orphan_heap_stats_with_lock(heap);
   caml_plat_unlock(&pool_freelist.lock);
+
   caml_gc_log("Orphan shared heap. Released %d active pools, %d large",
               released, released_large);
 }
 
 void caml_adopt_all_orphan_heaps(struct caml_heap_state* local) {
   int received_p = 0, received_l = 0;
-  caml_plat_lock_blocking(&pool_freelist.lock);
-  for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
-    received_p += move_all_pools(
-        (pool**)&pool_freelist.global_avail_pools[i],
-        (_Atomic(pool*)*)&local->unswept_avail_pools[i],
-        local->owner);
-    received_p += move_all_pools(
-        (pool**)&pool_freelist.global_full_pools[i],
-        (_Atomic(pool*)*)&local->unswept_full_pools[i],
-        local->owner);
+  for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+    struct pool_freelist_state* fl = &pool_freelists[a];
+    caml_plat_lock_blocking(&fl->lock);
+    for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
+      received_p += move_all_pools(
+          (pool**)&fl->global_avail_pools[i],
+          (_Atomic(pool*)*)&local->unswept_avail_pools[a][i],
+          local->owner);
+      received_p += move_all_pools(
+          (pool**)&fl->global_full_pools[i],
+          (_Atomic(pool*)*)&local->unswept_full_pools[a][i],
+          local->owner);
+    }
+    while (fl->global_large) {
+      large_alloc* la = fl->global_large;
+      fl->global_large = la->next;
+      la->owner = local->owner;
+      la->next = local->unswept_large[a];
+      local->unswept_large[a] = la;
+      received_l++;
+    }
+    if (received_p || received_l) {
+      adopt_all_pool_stats_with_lock(local);
+    }
+    caml_plat_unlock(&fl->lock);
   }
-  while (pool_freelist.global_large) {
-    large_alloc* a = pool_freelist.global_large;
-    pool_freelist.global_large = a->next;
-    a->owner = local->owner;
-    a->next = local->unswept_large;
-    local->unswept_large = a;
-    received_l++;
-  }
-  if (received_p || received_l) {
-    adopt_all_pool_stats_with_lock(local);
-  }
-  caml_plat_unlock(&pool_freelist.lock);
   if (received_p || received_l)
     caml_gc_log("Received %d new pools, %d new large allocs",
                 received_p, received_l);
+  local->next_arena_to_sweep = ARENA_DRAM;
   local->next_to_sweep = 0;
 }
 
 void caml_assert_shared_heap_is_empty(struct caml_heap_state* heap) {
-  for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
-    CAMLassert(!heap->avail_pools[i]);
-    CAMLassert(!heap->full_pools[i]);
-    CAMLassert(!heap->unswept_avail_pools[i]);
-    CAMLassert(!heap->unswept_full_pools[i]);
+  for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+    for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
+      CAMLassert(!heap->avail_pools[a][i]);
+      CAMLassert(!heap->full_pools[a][i]);
+      CAMLassert(!heap->unswept_avail_pools[a][i]);
+      CAMLassert(!heap->unswept_full_pools[a][i]);
+    }
+    CAMLassert(!heap->unswept_large[a]);
+    CAMLassert(!heap->swept_large[a]);
   }
-  CAMLassert(!heap->unswept_large);
-  CAMLassert(!heap->swept_large);
 }
 
 void caml_free_shared_heap(struct caml_heap_state* heap) {
@@ -225,26 +273,38 @@ void caml_free_shared_heap(struct caml_heap_state* heap) {
 
 /* Allocating and deallocating pools from the global freelist. */
 
-static pool* pool_acquire(struct caml_heap_state* local) {
+static pool* pool_acquire(struct caml_heap_state* local, caml_arena_id arena) {
   pool* r;
+  struct pool_freelist_state* fl = &pool_freelists[arena];
 
-  caml_plat_lock_blocking(&pool_freelist.lock);
-  if (!pool_freelist.free) {
+  if (arena == ARENA_FAR) {
+    r = (pool*)caml_dax_pool_acquire();
+    if (r) {
+      r->next = NULL;
+      r->owner = NULL;
+      r->arena = ARENA_FAR;
+    }
+    return r;
+  }
+
+  caml_plat_lock_blocking(&fl->lock);
+  if (!fl->free) {
     void* mem = caml_mem_map(Bsize_wsize(POOL_WSIZE), 0);
 
     if (mem) {
-      CAMLassert(pool_freelist.free == NULL);
+      CAMLassert(fl->free == NULL);
 
       r = (pool*)mem;
-      r->next = pool_freelist.free;
+      r->next = fl->free;
       r->owner = NULL;
-      pool_freelist.free = r;
+      r->arena = ARENA_DRAM;
+      fl->free = r;
     }
   }
-  r = pool_freelist.free;
+  r = fl->free;
   if (r)
-    pool_freelist.free = r->next;
-  caml_plat_unlock(&pool_freelist.lock);
+    fl->free = r->next;
+  caml_plat_unlock(&fl->lock);
 
   if (r) CAMLassert (r->owner == NULL);
   return r;
@@ -259,13 +319,18 @@ static void pool_release(struct caml_heap_state* local,
   CAMLassert(pool->sz == sz);
   local->stats.pool_words -= POOL_WSIZE;
   local->stats.pool_frag_words -= POOL_HEADER_WSIZE + padding_sizeclass[sz];
-  caml_plat_lock_blocking(&pool_freelist.lock);
-  pool->next = pool_freelist.free;
-  pool_freelist.free = pool;
-  caml_plat_unlock(&pool_freelist.lock);
+  if (pool->arena == ARENA_FAR) {
+    caml_dax_pool_release(pool);
+    return;
+  }
+  struct pool_freelist_state* fl = &pool_freelists[pool->arena];
+  caml_plat_lock_blocking(&fl->lock);
+  pool->next = fl->free;
+  fl->free = pool;
+  caml_plat_unlock(&fl->lock);
 }
 
-/* free the memory of [pool], giving it back to the OS */
+/* free the memory of [pool], giving it back to the OS (DRAM) or DAX freelist */
 static void pool_free(struct caml_heap_state* local,
                          pool* pool,
                          sizeclass sz)
@@ -273,7 +338,11 @@ static void pool_free(struct caml_heap_state* local,
     CAMLassert(pool->sz == sz);
     local->stats.pool_words -= POOL_WSIZE;
     local->stats.pool_frag_words -= POOL_HEADER_WSIZE + padding_sizeclass[sz];
-    caml_mem_unmap(pool, Bsize_wsize(POOL_WSIZE));
+    if (pool->arena == ARENA_FAR) {
+      caml_dax_pool_release(pool);
+    } else {
+      caml_mem_unmap(pool, Bsize_wsize(POOL_WSIZE));
+    }
 }
 
 static void calc_pool_stats(pool* a, sizeclass sz, struct heap_stats* s)
@@ -332,28 +401,30 @@ static intnat pool_sweep(struct caml_heap_state* local,
 static void pool_finalise(struct caml_heap_state* local, pool**,
                           sizeclass sz);
 
-/* Adopt pool from the pool_freelist avail and full pools
+/* Adopt pool from the per-arena freelist avail and full pools
    to satisfy an allocation */
-static pool* pool_global_adopt(struct caml_heap_state* local, sizeclass sz)
+static pool* pool_global_adopt(struct caml_heap_state* local,
+                               sizeclass sz, caml_arena_id arena)
 {
   pool* r = NULL;
   int adopted_pool = 0;
+  struct pool_freelist_state* fl = &pool_freelists[arena];
 
   /* probably no available pools out there to be had */
-  if( !atomic_load_relaxed(&pool_freelist.global_avail_pools[sz]) &&
-      !atomic_load_relaxed(&pool_freelist.global_full_pools[sz]) )
+  if( !atomic_load_relaxed(&fl->global_avail_pools[sz]) &&
+      !atomic_load_relaxed(&fl->global_full_pools[sz]) )
     return NULL;
 
   /* Haven't managed to find a pool locally, try the global ones */
-  caml_plat_lock_blocking(&pool_freelist.lock);
-  if( atomic_load_relaxed(&pool_freelist.global_avail_pools[sz]) ) {
-    r = atomic_load_relaxed(&pool_freelist.global_avail_pools[sz]);
+  caml_plat_lock_blocking(&fl->lock);
+  if( atomic_load_relaxed(&fl->global_avail_pools[sz]) ) {
+    r = atomic_load_relaxed(&fl->global_avail_pools[sz]);
 
     if( r ) {
-      atomic_store_relaxed(&pool_freelist.global_avail_pools[sz], r->next);
+      atomic_store_relaxed(&fl->global_avail_pools[sz], r->next);
       r->next = 0;
       r->owner = local->owner;
-      local->avail_pools[sz] = r;
+      local->avail_pools[arena][sz] = r;
       adopt_pool_stats_with_lock(local, r, sz);
 
       #ifdef DEBUG
@@ -372,13 +443,13 @@ static pool* pool_global_adopt(struct caml_heap_state* local, sizeclass sz)
   /* There were no global avail pools, so let's adopt one of the full ones and
      try our luck sweeping it later on */
   if( !r ) {
-    r = atomic_load_relaxed(&pool_freelist.global_full_pools[sz]);
+    r = atomic_load_relaxed(&fl->global_full_pools[sz]);
 
     if( r ) {
-      atomic_store_relaxed(&pool_freelist.global_full_pools[sz], r->next);
-      r->next = local->full_pools[sz];
+      atomic_store_relaxed(&fl->global_full_pools[sz], r->next);
+      r->next = local->full_pools[arena][sz];
       r->owner = local->owner;
-      local->full_pools[sz] = r;
+      local->full_pools[arena][sz] = r;
       adopt_pool_stats_with_lock(local, r, sz);
 
       adopted_pool = 1;
@@ -386,12 +457,12 @@ static pool* pool_global_adopt(struct caml_heap_state* local, sizeclass sz)
     }
   }
 
-  caml_plat_unlock(&pool_freelist.lock);
+  caml_plat_unlock(&fl->lock);
 
   if( !r && adopted_pool ) {
     Caml_state->sweep_work_done_between_slices +=
-      pool_sweep(local, &local->full_pools[sz], sz, 0);
-    r = local->avail_pools[sz];
+      pool_sweep(local, &local->full_pools[arena][sz], sz, 0);
+    r = local->avail_pools[arena][sz];
   }
 
   CAMLassert(r == NULL || r->owner == local->owner);
@@ -399,28 +470,29 @@ static pool* pool_global_adopt(struct caml_heap_state* local, sizeclass sz)
 }
 
 /* Allocating an object from a pool */
-static pool* pool_find(struct caml_heap_state* local, sizeclass sz) {
+static pool* pool_find(struct caml_heap_state* local,
+                       sizeclass sz, caml_arena_id arena) {
   pool* r;
 
   /* Hopefully we have a pool we can use directly */
-  r = local->avail_pools[sz];
+  r = local->avail_pools[arena][sz];
   if (r) return r;
 
   /* Otherwise, try to sweep until we find one */
-  while (!local->avail_pools[sz] && local->unswept_avail_pools[sz]) {
+  while (!local->avail_pools[arena][sz] && local->unswept_avail_pools[arena][sz]) {
     Caml_state->sweep_work_done_between_slices +=
-      pool_sweep(local, &local->unswept_avail_pools[sz], sz, 0);
+      pool_sweep(local, &local->unswept_avail_pools[arena][sz], sz, 0);
   }
 
-  r = local->avail_pools[sz];
+  r = local->avail_pools[arena][sz];
   if (r) return r;
 
   /* Haven't managed to find a pool locally, try the global ones */
-  r = pool_global_adopt(local, sz);
+  r = pool_global_adopt(local, sz, arena);
   if (r) return r;
 
   /* Failing that, we need to allocate a new pool */
-  r = pool_acquire(local);
+  r = pool_acquire(local, arena);
   if (!r) return 0; /* if we can't allocate, give up */
 
   local->stats.pool_words += POOL_WSIZE;
@@ -429,16 +501,17 @@ static pool* pool_find(struct caml_heap_state* local, sizeclass sz) {
   local->stats.pool_frag_words += POOL_HEADER_WSIZE + padding_sizeclass[sz];
 
   /* Having allocated a new pool, set it up for size sz */
-  local->avail_pools[sz] = r;
+  local->avail_pools[arena][sz] = r;
   pool_initialize(r, sz, local->owner);
 
   return r;
 }
 
-static void* pool_allocate(struct caml_heap_state* local, sizeclass sz) {
+static void* pool_allocate(struct caml_heap_state* local,
+                           sizeclass sz, caml_arena_id arena) {
   value* p;
   value* next;
-  pool* r = pool_find(local, sz);
+  pool* r = pool_find(local, sz, arena);
 
   if (!r) return 0;
 
@@ -462,35 +535,43 @@ static void* pool_allocate(struct caml_heap_state* local, sizeclass sz) {
 
   r->next_obj = next;
   if (!next) {
-    local->avail_pools[sz] = r->next;
-    r->next = local->full_pools[sz];
-    local->full_pools[sz] = r;
+    local->avail_pools[arena][sz] = r->next;
+    r->next = local->full_pools[arena][sz];
+    local->full_pools[arena][sz] = r;
   }
 
   CAMLassert(
     /* either there's no more free space and we've moved the pool */
-    (r->next_obj == 0 && local->full_pools[sz] == r)
+    (r->next_obj == 0 && local->full_pools[arena][sz] == r)
     /* or there's still free space */
     || POOL_BLOCK_FREE_HP(r->next_obj));
 
   return p;
 }
 
-static void* large_allocate(struct caml_heap_state* local, mlsize_t sz) {
-  large_alloc* a = malloc(sz + LARGE_ALLOC_HEADER_SZ);
+static void* large_allocate(struct caml_heap_state* local,
+                             mlsize_t sz, caml_arena_id arena) {
+  large_alloc* a;
+  if (arena == ARENA_FAR) {
+    a = (large_alloc*)caml_dax_large_alloc(sz + LARGE_ALLOC_HEADER_SZ);
+  } else {
+    a = (large_alloc*)malloc(sz + LARGE_ALLOC_HEADER_SZ);
+  }
   if (!a) return NULL;
   local->stats.large_words += Wsize_bsize(sz + LARGE_ALLOC_HEADER_SZ);
   if (local->stats.large_words > local->stats.large_max_words)
     local->stats.large_max_words = local->stats.large_words;
   local->stats.large_blocks++;
   a->owner = local->owner;
-  a->next = local->swept_large;
-  local->swept_large = a;
+  a->arena = arena;
+  a->next = local->swept_large[arena];
+  local->swept_large[arena] = a;
   return (char*)a + LARGE_ALLOC_HEADER_SZ;
 }
 
-value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
-                             tag_t tag, reserved_t reserved)
+value* caml_shared_try_alloc_arena(struct caml_heap_state* local,
+                                   mlsize_t wosize, tag_t tag,
+                                   reserved_t reserved, caml_arena_id arena)
 {
   mlsize_t whsize = Whsize_wosize(wosize);
   value* p;
@@ -504,14 +585,14 @@ value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
     struct heap_stats* s;
     sizeclass sz = sizeclass_whsize[whsize];
     CAMLassert(whsize_sizeclass[sz] >= whsize);
-    p = pool_allocate(local, sz);
+    p = pool_allocate(local, sz, arena);
     if (!p) return 0;
     s = &local->stats;
     s->pool_live_blocks++;
     s->pool_live_words += whsize;
     s->pool_frag_words += wfrag_whsize[whsize];
   } else {
-    p = large_allocate(local, Bsize_wsize(whsize));
+    p = large_allocate(local, Bsize_wsize(whsize), arena);
     if (!p) return 0;
   }
   Hd_hp (p) = Make_header_with_reserved(wosize, tag,
@@ -529,7 +610,24 @@ value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
     }
   }
 #endif
+#ifdef CAML_DEBUG_FAR_ARENA
+  /* Verify that the returned pointer sits in the expected arena's address
+   * range.  Build with -DCAML_DEBUG_FAR_ARENA to enable. */
+  if (arena == ARENA_FAR) {
+    CAMLassert(caml_dax_contains(p) &&
+               "FAR allocation landed outside DAX region");
+  } else {
+    CAMLassert(!caml_dax_contains(p) &&
+               "DRAM allocation landed inside DAX region");
+  }
+#endif
   return p;
+}
+
+value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
+                             tag_t tag, reserved_t reserved)
+{
+  return caml_shared_try_alloc_arena(local, wosize, tag, reserved, ARENA_DRAM);
 }
 
 /* Sweeping of the major heap shared pools */
@@ -657,7 +755,9 @@ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
     if (release_to_global_pool) {
       pool_release(local, a, sz);
     } else {
-      pool** list = all_used ? &local->full_pools[sz] : &local->avail_pools[sz];
+      caml_arena_id a_arena = (caml_arena_id)a->arena;
+      pool** list = all_used ? &local->full_pools[a_arena][sz]
+                             : &local->avail_pools[a_arena][sz];
       a->next = *list;
       *list = a;
     }
@@ -667,14 +767,15 @@ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
   return work;
 }
 
-/* Sweep one large block. Returns the block's size. */
+/* Sweep one large block from the given arena. Returns the block's size. */
 
-static intnat large_alloc_sweep(struct caml_heap_state* local) {
+static intnat large_alloc_sweep(struct caml_heap_state* local,
+                                caml_arena_id arena) {
   value* p;
   header_t hd;
-  large_alloc* a = local->unswept_large;
+  large_alloc* a = local->unswept_large[arena];
   if (!a) return 0;
-  local->unswept_large = a->next;
+  local->unswept_large[arena] = a->next;
 
   p = (value*)((char*)a + LARGE_ALLOC_HEADER_SZ);
   /* The header being read here may be concurrently written by a thread doing
@@ -692,22 +793,25 @@ static intnat large_alloc_sweep(struct caml_heap_state* local) {
     local->owner->swept_words +=
       Whsize_hd(hd) + Wsize_bsize(LARGE_ALLOC_HEADER_SZ);
     local->stats.large_blocks--;
-    free(a);
+    if (arena == ARENA_DRAM) {
+      free(a);
+    } /* FAR: bump allocator; memory is not reclaimed */
   } else {
-    a->next = local->swept_large;
-    local->swept_large = a;
+    a->next = local->swept_large[arena];
+    local->swept_large[arena] = a;
   }
 
   return Whsize_hd(hd);
 }
 
-static void large_alloc_finalise(struct caml_heap_state* local) {
+static void large_alloc_finalise(struct caml_heap_state* local,
+                                 caml_arena_id arena) {
   value* p;
   header_t hd;
   large_alloc* a;
 
-  while ((a = local->unswept_large) != 0) {
-    local->unswept_large = a->next;
+  while ((a = local->unswept_large[arena]) != 0) {
+    local->unswept_large[arena] = a->next;
 
     p = (value*)((char*)a + LARGE_ALLOC_HEADER_SZ);
     hd = Hd_hp(p);
@@ -715,35 +819,52 @@ static void large_alloc_finalise(struct caml_heap_state* local) {
       void (*final_fun)(value) = Custom_ops_val(Val_hp(p))->finalize;
       if (final_fun != NULL) final_fun(Val_hp(p));
     }
-    free(a);
+    if (arena == ARENA_DRAM) {
+      free(a);
+    } /* FAR: bump allocator; memory is not reclaimed */
   }
 }
 
 static void verify_swept(struct caml_heap_state*);
 
 intnat caml_sweep(struct caml_heap_state* local, intnat work) {
-  /* Sweep local pools */
-  while (work > 0 && local->next_to_sweep < NUM_SIZECLASSES) {
-    sizeclass sz = local->next_to_sweep;
-    work -= pool_sweep(local, &local->unswept_avail_pools[sz], sz, 1);
+  /* Sweep arenas in order (DRAM first, then FAR). Within each arena, sweep
+   * pool sizeclasses then large allocations. The cursor (next_arena_to_sweep,
+   * next_to_sweep) is reset by caml_cycle_heap / caml_adopt_all_orphan_heaps. */
+  while (work > 0 && local->next_arena_to_sweep < NUM_ARENAS) {
+    caml_arena_id a = local->next_arena_to_sweep;
 
-    if (work > 0) {
-      work -= pool_sweep(local, &local->unswept_full_pools[sz], sz, 1);
+    /* Sweep pools for this arena */
+    while (work > 0 && local->next_to_sweep < NUM_SIZECLASSES) {
+      sizeclass sz = local->next_to_sweep;
+      work -= pool_sweep(local, &local->unswept_avail_pools[a][sz], sz, 1);
+
+      if (work > 0) {
+        work -= pool_sweep(local, &local->unswept_full_pools[a][sz], sz, 1);
+      }
+
+      if (local->unswept_avail_pools[a][sz] == NULL &&
+          local->unswept_full_pools[a][sz] == NULL) {
+        local->next_to_sweep++;
+      }
     }
 
-    if (local->unswept_avail_pools[sz] == NULL &&
-        local->unswept_full_pools[sz] == NULL) {
-      local->next_to_sweep++;
+    if (local->next_to_sweep < NUM_SIZECLASSES) break; /* budget exhausted */
+
+    /* Sweep large allocs for this arena */
+    while (work > 0 && local->unswept_large[a]) {
+      work -= large_alloc_sweep(local, a);
     }
+
+    if (local->unswept_large[a]) break; /* budget exhausted */
+
+    /* Advance to next arena */
+    local->next_arena_to_sweep++;
+    local->next_to_sweep = 0;
   }
 
-  /* Sweep global pools */
-  while (work > 0 && local->unswept_large) {
-    work -= large_alloc_sweep(local);
-  }
-
-  if (caml_params->verify_heap && work > 0) {
-    /* sweeping is complete, check everything worked */
+  if (caml_params->verify_heap && local->next_arena_to_sweep >= NUM_ARENAS) {
+    /* sweeping is complete for all arenas, check everything worked */
     verify_swept(local);
   }
   return work;
@@ -783,17 +904,18 @@ static void pool_finalise(struct caml_heap_state* local, pool** plist,
 
 void caml_finalise_heap(void) {
   struct caml_heap_state *local = Caml_state->shared_heap;
-  sizeclass sz;
 
-  /* Finalise and release unswept local pools. */
-  for (sz = 0; sz < NUM_SIZECLASSES; sz++) {
-    pool_finalise(local, &local->unswept_avail_pools[sz], sz);
-    pool_finalise(local, &local->unswept_full_pools[sz], sz);
+  for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+    /* Finalise and release unswept local pools. */
+    for (sizeclass sz = 0; sz < NUM_SIZECLASSES; sz++) {
+      pool_finalise(local, &local->unswept_avail_pools[a][sz], sz);
+      pool_finalise(local, &local->unswept_full_pools[a][sz], sz);
+    }
+
+    /* Finalise and free large unswept objects. */
+    if (local->unswept_large[a])
+      large_alloc_finalise(local, a);
   }
-
-  /* Finalise and free large unswept objects. */
-  if (local->unswept_large)
-    large_alloc_finalise(local);
 }
 
 uintnat caml_heap_size(struct caml_heap_state* local) {
@@ -1191,34 +1313,38 @@ void caml_compact_heap(caml_domain_state* domain_state,
 
   #ifdef DEBUG
   /* Check preconditions for the heap: */
-  for (sizeclass sz_class = 1; sz_class < NUM_SIZECLASSES; sz_class++) {
-    /* No sweeping has happened yet */
-    CAMLassert(heap->avail_pools[sz_class] == NULL);
-    CAMLassert(heap->full_pools[sz_class] == NULL);
-    CAMLassert(heap->swept_large == NULL);
-    /* No pools waiting for adoption */
-    if (participants[0] == Caml_state) {
-      CAMLassert(
-          atomic_load_relaxed(&pool_freelist.global_avail_pools[sz_class]) ==
-            NULL);
-      CAMLassert(
-          atomic_load_relaxed(&pool_freelist.global_full_pools[sz_class]) ==
-            NULL);
+  for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+    for (sizeclass sz_class = 1; sz_class < NUM_SIZECLASSES; sz_class++) {
+      /* No sweeping has happened yet */
+      CAMLassert(heap->avail_pools[a][sz_class] == NULL);
+      CAMLassert(heap->full_pools[a][sz_class] == NULL);
+      /* No pools waiting for adoption */
+      if (participants[0] == Caml_state) {
+        CAMLassert(
+            atomic_load_relaxed(
+              &pool_freelists[a].global_avail_pools[sz_class]) == NULL);
+        CAMLassert(
+            atomic_load_relaxed(
+              &pool_freelists[a].global_full_pools[sz_class]) == NULL);
+      }
     }
-    /* The minor heap is empty */
-    CAMLassert(Caml_state->young_ptr == Caml_state->young_end);
-    /* The mark stack is empty */
-    CAMLassert(caml_mark_stack_is_empty());
+    CAMLassert(heap->swept_large[a] == NULL);
   }
+  /* The minor heap is empty */
+  CAMLassert(Caml_state->young_ptr == Caml_state->young_end);
+  /* The mark stack is empty */
+  CAMLassert(caml_mark_stack_is_empty());
   #endif
 
-  /* All evacuated pools (of every size class) */
+  /* All evacuated pools (of every size class). Week 4: only DRAM is compacted;
+   * FAR (devdax) pools are not evacuated because the bump allocator cannot
+   * reclaim them. The pointer-update pass (phase 2) still scans FAR pools. */
   pool *evacuated_pools = NULL;
 
   for (sizeclass sz_class = 1; sz_class < NUM_SIZECLASSES; sz_class++) {
     /* We only care about moving things in pools that aren't full (we cannot
     evacuate to or from a full pool) */
-    pool* cur_pool = heap->unswept_avail_pools[sz_class];
+    pool* cur_pool = heap->unswept_avail_pools[ARENA_DRAM][sz_class];
 
     if (!cur_pool) {
       /* No partially filled pools for this size, nothing to do */
@@ -1246,7 +1372,7 @@ void caml_compact_heap(caml_domain_state* domain_state,
       continue;
     }
 
-    cur_pool = heap->unswept_avail_pools[sz_class];
+    cur_pool = heap->unswept_avail_pools[ARENA_DRAM][sz_class];
 
     /* Count the number of free and live blocks in each pool. Note that a live
        block here currently has the header status UNMARKED (because it was
@@ -1314,12 +1440,12 @@ void caml_compact_heap(caml_domain_state* domain_state,
     size_t j = 0;
     size_t remaining_live_blocks = total_live_blocks;
 
-    cur_pool = heap->unswept_avail_pools[sz_class];
+    cur_pool = heap->unswept_avail_pools[ARENA_DRAM][sz_class];
     /* [last_pool_p] will be a pointer to the next field of the last
        non-evacuating pool. We need this so we can snip the list of evacuating
        pools from [unswept_avail_pools] and eventually attach them all to
        [evacuated_pools]. */
-    pool **last_pool_p = &heap->unswept_avail_pools[sz_class];
+    pool **last_pool_p = &heap->unswept_avail_pools[ARENA_DRAM][sz_class];
     while (cur_pool) {
       if (free_blocks >= remaining_live_blocks) {
         break;
@@ -1360,7 +1486,7 @@ void caml_compact_heap(caml_domain_state* domain_state,
           if (Has_status_hd(hd, caml_global_heap_state.UNMARKED)) {
             /* live block in an evacuating pool, so we evacuate it to
              * the first available block */
-            pool* to_pool = heap->unswept_avail_pools[sz_class];
+            pool* to_pool = heap->unswept_avail_pools[ARENA_DRAM][sz_class];
             value* new_p = to_pool->next_obj;
             CAMLassert(POOL_BLOCK_FREE_HP(new_p));
             /* if there are free blocks after this, use those */
@@ -1384,9 +1510,9 @@ void caml_compact_heap(caml_domain_state* domain_state,
 
               if (!next) {
                 /* This pool is full. Move it to unswept_full_pools */
-                heap->unswept_avail_pools[sz_class] = to_pool->next;
-                to_pool->next = heap->unswept_full_pools[sz_class];
-                heap->unswept_full_pools[sz_class] = to_pool;
+                heap->unswept_avail_pools[ARENA_DRAM][sz_class] = to_pool->next;
+                to_pool->next = heap->unswept_full_pools[ARENA_DRAM][sz_class];
+                heap->unswept_full_pools[ARENA_DRAM][sz_class] = to_pool;
               }
             }
 
@@ -1463,17 +1589,22 @@ void caml_compact_heap(caml_domain_state* domain_state,
     caml_scan_global_roots(&compact_update_value, NULL);
   }
 
-  /* Shared heap pools. */
-  for (sizeclass sz_class = 1; sz_class < NUM_SIZECLASSES; sz_class++) {
-    compact_update_pools(heap->unswept_avail_pools[sz_class]);
-    compact_update_pools(heap->unswept_full_pools[sz_class]);
+  /* Shared heap pools — scan all arenas (FAR objects may point to moved DRAM
+   * objects even though FAR pools themselves were not evacuated). */
+  for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+    for (sizeclass sz_class = 1; sz_class < NUM_SIZECLASSES; sz_class++) {
+      compact_update_pools(heap->unswept_avail_pools[a][sz_class]);
+      compact_update_pools(heap->unswept_full_pools[a][sz_class]);
+    }
   }
 
-  /* Large allocations */
-  for (large_alloc *la = heap->unswept_large; la != NULL; la = la->next) {
-    header_t* p = (header_t*)((char*)la + LARGE_ALLOC_HEADER_SZ);
-    if (Has_status_val(Val_hp(p), caml_global_heap_state.UNMARKED)) {
-      compact_update_block(p);
+  /* Large allocations — scan all arenas */
+  for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+    for (large_alloc *la = heap->unswept_large[a]; la != NULL; la = la->next) {
+      header_t* p = (header_t*)((char*)la + LARGE_ALLOC_HEADER_SZ);
+      if (Has_status_val(Val_hp(p), caml_global_heap_state.UNMARKED)) {
+        compact_update_block(p);
+      }
     }
   }
 
@@ -1510,13 +1641,15 @@ void caml_compact_heap(caml_domain_state* domain_state,
   CAML_EV_END(EV_COMPACT_RELEASE);
   caml_global_barrier(participating_count);
 
-  /* Fourth phase: one domain also needs to release the free list */
+  /* Fourth phase: one domain also needs to release the DRAM free list.
+   * FAR freelist pools are owned by the DAX bump allocator and not unmapped. */
   if( participants[0] == Caml_state ) {
     pool* cur_pool;
     pool* next_pool;
 
-    caml_plat_lock_blocking(&pool_freelist.lock);
-    cur_pool = pool_freelist.free;
+    struct pool_freelist_state* fl = &pool_freelists[ARENA_DRAM];
+    caml_plat_lock_blocking(&fl->lock);
+    cur_pool = fl->free;
 
     while( cur_pool ) {
       next_pool = cur_pool->next;
@@ -1525,9 +1658,9 @@ void caml_compact_heap(caml_domain_state* domain_state,
       cur_pool = next_pool;
     }
 
-    pool_freelist.free = NULL;
+    fl->free = NULL;
 
-    caml_plat_unlock(&pool_freelist.lock);
+    caml_plat_unlock(&fl->lock);
 
     /* We are done, increment our compaction count */
     atomic_fetch_add(&caml_compactions_count, 1);
@@ -1601,23 +1734,24 @@ static void verify_swept (struct caml_heap_state* local) {
   struct mem_stats pool_stats = {0,}, large_stats = {0,};
 
   /* sweeping should be done by this point */
-  CAMLassert(local->next_to_sweep == NUM_SIZECLASSES);
-  for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
-    CAMLassert(local->unswept_avail_pools[i] == NULL);
-    CAMLassert(local->unswept_full_pools[i] == NULL);
-    for (pool *p = local->avail_pools[i]; p; p = p->next)
-      verify_pool(p, i, &pool_stats);
-    for (pool *p = local->full_pools[i]; p; p = p->next) {
-      CAMLassert(p->next_obj == NULL);
-      verify_pool(p, i, &pool_stats);
+  CAMLassert(local->next_arena_to_sweep >= NUM_ARENAS);
+  for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+    for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
+      CAMLassert(local->unswept_avail_pools[a][i] == NULL);
+      CAMLassert(local->unswept_full_pools[a][i] == NULL);
+      for (pool *p = local->avail_pools[a][i]; p; p = p->next)
+        verify_pool(p, i, &pool_stats);
+      for (pool *p = local->full_pools[a][i]; p; p = p->next) {
+        CAMLassert(p->next_obj == NULL);
+        verify_pool(p, i, &pool_stats);
+      }
     }
+    verify_large(local->swept_large[a], &large_stats);
+    CAMLassert(local->unswept_large[a] == NULL);
   }
   caml_gc_log("Pooled memory: %" CAML_PRIuNAT " allocated, "
               "%" CAML_PRIuNAT " free, %" CAML_PRIuNAT " fragmentation",
               pool_stats.allocated, pool_stats.free, pool_stats.overhead);
-
-  verify_large(local->swept_large, &large_stats);
-  CAMLassert(local->unswept_large == NULL);
   caml_gc_log("Large memory: %" CAML_PRIuNAT " allocated, "
               "%" CAML_PRIuNAT " free, %" CAML_PRIuNAT " fragmentation",
               large_stats.allocated, large_stats.free, large_stats.overhead);
@@ -1646,17 +1780,19 @@ void caml_cycle_heap_from_stw_single (void) {
 
 void caml_cycle_heap(struct caml_heap_state* local) {
   caml_gc_log("Cycling heap [%02d]", local->owner->id);
-  for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
-    CAMLassert(local->unswept_avail_pools[i] == NULL);
-    local->unswept_avail_pools[i] = local->avail_pools[i];
-    local->avail_pools[i] = NULL;
-    CAMLassert(local->unswept_full_pools[i] == NULL);
-    local->unswept_full_pools[i] = local->full_pools[i];
-    local->full_pools[i] = NULL;
+  for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+    for (sizeclass i = 0; i < NUM_SIZECLASSES; i++) {
+      CAMLassert(local->unswept_avail_pools[a][i] == NULL);
+      local->unswept_avail_pools[a][i] = local->avail_pools[a][i];
+      local->avail_pools[a][i] = NULL;
+      CAMLassert(local->unswept_full_pools[a][i] == NULL);
+      local->unswept_full_pools[a][i] = local->full_pools[a][i];
+      local->full_pools[a][i] = NULL;
+    }
+    CAMLassert(local->unswept_large[a] == NULL);
+    local->unswept_large[a] = local->swept_large[a];
+    local->swept_large[a] = NULL;
   }
-  CAMLassert(local->unswept_large == NULL);
-  local->unswept_large = local->swept_large;
-  local->swept_large = NULL;
 
   caml_adopt_all_orphan_heaps(local);
 }
@@ -1664,13 +1800,18 @@ void caml_cycle_heap(struct caml_heap_state* local) {
 void caml_finalise_freelist(void) {
   int freed_large = 0;
 
-  caml_plat_lock_blocking(&pool_freelist.lock);
-  while (pool_freelist.global_large) {
-    large_alloc* a = pool_freelist.global_large;
-    pool_freelist.global_large = a->next;
-    free(a);
-    freed_large++;
+  for (caml_arena_id a = 0; a < NUM_ARENAS; a++) {
+    struct pool_freelist_state* fl = &pool_freelists[a];
+    caml_plat_lock_blocking(&fl->lock);
+    while (fl->global_large) {
+      large_alloc* la = fl->global_large;
+      fl->global_large = la->next;
+      if (a == ARENA_DRAM) {
+        free(la);
+      } /* FAR: bump allocator; memory is not reclaimed */
+      freed_large++;
+    }
+    caml_plat_unlock(&fl->lock);
   }
-  caml_plat_unlock(&pool_freelist.lock);
   caml_gc_log("Finalise freelist. Freed %d large", freed_large);
 }

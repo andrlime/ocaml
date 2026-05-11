@@ -1217,6 +1217,7 @@ runtime_COMMON_C_SOURCES = \
   codefrag \
   compare \
   custom \
+  dax_arena \
   debugger \
   domain \
   dynlink \
