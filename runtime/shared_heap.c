@@ -51,11 +51,7 @@ typedef struct pool {
   value* next_obj;
   caml_domain_state* owner;
   sizeclass sz;
-  /* arena field is read by pool_release / pool_free to route the pool back
-   * to the correct freelist (and to skip caml_mem_unmap for far-arena pools,
-   * which are owned by the DAX allocator). 1 byte fits in existing padding;
-   * sizeof(pool) is unchanged. */
-  unsigned char arena;
+  unsigned char arena; /* ARENA_DRAM or ARENA_FAR; fits in existing padding */
 } pool;
 static_assert(sizeof(pool) == Bsize_wsize(POOL_HEADER_WSIZE), "");
 #define POOL_SLAB_WOFFSET(sz) (POOL_HEADER_WSIZE + padding_sizeclass[sz])
@@ -71,9 +67,7 @@ static_assert(sizeof(pool) == Bsize_wsize(POOL_HEADER_WSIZE), "");
 typedef struct large_alloc {
   caml_domain_state* owner;
   struct large_alloc* next;
-  /* See note on `pool::arena`. The full uintnat keeps sizeof a multiple of
-   * sizeof(value); we have plenty of slack since this is per-large-block. */
-  uintnat arena;
+  uintnat arena; /* ARENA_DRAM or ARENA_FAR; uintnat keeps sizeof(large_alloc) aligned */
 } large_alloc;
 static_assert(sizeof(large_alloc) % sizeof(value) == 0, "");
 #define LARGE_ALLOC_HEADER_SZ sizeof(large_alloc)
@@ -108,14 +102,10 @@ static struct pool_freelist_state pool_freelists[NUM_ARENAS] = {
   },
 };
 
-/* The DRAM freelist is the historical singleton; keep an alias so existing
- * call sites that don't care about arenas don't grow noisy. */
 #define pool_freelist (pool_freelists[ARENA_DRAM])
 
 /* readable and writable only by the current thread */
 struct caml_heap_state {
-  /* Per-arena pool / large-alloc state. Index 0 is the DRAM (caml_mem_map)
-   * arena; index 1 is the DAX-backed far-memory arena. */
   pool* avail_pools[NUM_ARENAS][NUM_SIZECLASSES];
   pool* full_pools[NUM_ARENAS][NUM_SIZECLASSES];
   pool* unswept_avail_pools[NUM_ARENAS][NUM_SIZECLASSES];
@@ -124,9 +114,7 @@ struct caml_heap_state {
   large_alloc* swept_large[NUM_ARENAS];
   large_alloc* unswept_large[NUM_ARENAS];
 
-  /* Sweep cursor. We sweep DRAM first, then FAR; per-arena cursor avoids
-   * a wider type. Reset to (ARENA_DRAM, 0) on caml_cycle_heap. */
-  caml_arena_id next_arena_to_sweep;
+  caml_arena_id next_arena_to_sweep; /* outer sweep cursor; reset each cycle */
   sizeclass next_to_sweep;
 
   caml_domain_state* owner;
@@ -207,8 +195,7 @@ void caml_orphan_shared_heap(struct caml_heap_state* heap) {
     caml_plat_unlock(&fl->lock);
   }
 
-  /* Heap stats are aggregated, not per-arena, so accumulate them once into
-   * the DRAM freelist's stats slot (a Week-4 simplification). */
+  /* Stats are not per-arena; fold into the DRAM slot. */
   caml_plat_lock_blocking(&pool_freelist.lock);
   orphan_heap_stats_with_lock(heap);
   caml_plat_unlock(&pool_freelist.lock);
@@ -611,8 +598,6 @@ value* caml_shared_try_alloc_arena(struct caml_heap_state* local,
   }
 #endif
 #ifdef CAML_DEBUG_FAR_ARENA
-  /* Verify that the returned pointer sits in the expected arena's address
-   * range.  Build with -DCAML_DEBUG_FAR_ARENA to enable. */
   if (arena == ARENA_FAR) {
     CAMLassert(caml_dax_contains(p) &&
                "FAR allocation landed outside DAX region");
@@ -828,13 +813,9 @@ static void large_alloc_finalise(struct caml_heap_state* local,
 static void verify_swept(struct caml_heap_state*);
 
 intnat caml_sweep(struct caml_heap_state* local, intnat work) {
-  /* Sweep arenas in order (DRAM first, then FAR). Within each arena, sweep
-   * pool sizeclasses then large allocations. The cursor (next_arena_to_sweep,
-   * next_to_sweep) is reset by caml_cycle_heap / caml_adopt_all_orphan_heaps. */
   while (work > 0 && local->next_arena_to_sweep < NUM_ARENAS) {
     caml_arena_id a = local->next_arena_to_sweep;
 
-    /* Sweep pools for this arena */
     while (work > 0 && local->next_to_sweep < NUM_SIZECLASSES) {
       sizeclass sz = local->next_to_sweep;
       work -= pool_sweep(local, &local->unswept_avail_pools[a][sz], sz, 1);
@@ -851,22 +832,18 @@ intnat caml_sweep(struct caml_heap_state* local, intnat work) {
 
     if (local->next_to_sweep < NUM_SIZECLASSES) break; /* budget exhausted */
 
-    /* Sweep large allocs for this arena */
     while (work > 0 && local->unswept_large[a]) {
       work -= large_alloc_sweep(local, a);
     }
 
     if (local->unswept_large[a]) break; /* budget exhausted */
 
-    /* Advance to next arena */
     local->next_arena_to_sweep++;
     local->next_to_sweep = 0;
   }
 
-  if (caml_params->verify_heap && local->next_arena_to_sweep >= NUM_ARENAS) {
-    /* sweeping is complete for all arenas, check everything worked */
+  if (caml_params->verify_heap && local->next_arena_to_sweep >= NUM_ARENAS)
     verify_swept(local);
-  }
   return work;
 }
 

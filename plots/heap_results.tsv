@@ -1,0 +1,3 @@
+arena	pattern	bw_mean	bw_std	lat_mean	lat_std	status
+DRAM	promote	162.0694	13.6382	0.53	0.05	measured
+FAR	promote	67.3300	5.6913	1.27	0.13	measured

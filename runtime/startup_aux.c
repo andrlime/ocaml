@@ -165,7 +165,6 @@ void caml_parse_ocamlrunparam(void)
 
   caml_stat_free(opt_tofree);
 
-  /* Tiered-major-heap: initialise DAX arena and read OCAML_FAR_ALL. */
   caml_dax_arena_init();
   {
     const char* far_all = getenv("OCAML_FAR_ALL");

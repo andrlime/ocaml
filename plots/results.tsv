@@ -1,0 +1,5 @@
+arena	pattern	bw_mean	bw_std	lat_mean	lat_std	status
+DRAM	seq-write	9.6280	0.0175	6.65	0.01	measured
+DRAM	rand-write	3.9581	0.0060	16.17	0.02	measured
+FAR	seq-write	1.8814	0.0200	34.02	0.37	measured
+FAR	rand-write	0.7738	0.0044	82.71	0.47	measured

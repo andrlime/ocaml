@@ -6,39 +6,16 @@
 /*                                                                        */
 /**************************************************************************/
 
-/* DAX-backed pool allocator. See runtime/caml/dax_arena.h for the contract.
- *
- * The arena is a single global object initialised lazily. After init succeeds
- * it owns a contiguous region of the device, split into two zones:
- *
- *   [base, large_zone_end)   - bump-pointer region for >SIZECLASS_MAX
- *                              allocations. Cursor advances under the lock.
- *   [large_zone_end, end)    - pool zone, sliced into Bsize_wsize(POOL_WSIZE)
- *                              chunks. Acquire pops from a LIFO free list,
- *                              then advances a cursor when the list is empty.
- *
- * Bump regions are not reclaimed; pool regions are reused indefinitely.
- *
- * Multi-arena bring-up (Week 4 of the tiered major-heap project): only one
- * device is supported. Extending to multiple far-memory arenas would require
- * one descriptor per device.
- */
-
 #define CAML_INTERNALS
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-
-#ifdef _WIN32
-/* DAX is a Linux feature; on Windows the arena is permanently unavailable. */
-#else
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#endif
 
 #include "caml/config.h"
 #include "caml/dax_arena.h"
@@ -57,38 +34,25 @@ struct dax_pool_node {
 };
 
 struct dax_arena {
-  /* Set once during init under [init_lock]; readable lock-free thereafter. */
   void*    base;
   size_t   total_bytes;
   size_t   large_zone_bytes;
-  size_t   pool_bytes;          /* Bsize_wsize(POOL_WSIZE) */
+  size_t   pool_bytes;
   int      available;
   int      tried;
   int      fd;
-
-  /* Mutates under [alloc_lock]. */
   caml_plat_mutex alloc_lock;
-  size_t   large_cursor;        /* offset into [base, base+large_zone_bytes) */
-  size_t   pool_cursor;         /* offset into [base+large_zone_bytes, base+total_bytes) */
+  size_t   large_cursor;
+  size_t   pool_cursor;
   struct dax_pool_node* free_list;
   int      large_exhausted_warned;
   int      pool_exhausted_warned;
 };
 
 static struct dax_arena arena = {
-  /* base */              NULL,
-  /* total_bytes */       0,
-  /* large_zone_bytes */  0,
-  /* pool_bytes */        0,
-  /* available */         0,
-  /* tried */             0,
-  /* fd */                -1,
-  /* alloc_lock */        CAML_PLAT_MUTEX_INITIALIZER,
-  /* large_cursor */      0,
-  /* pool_cursor */       0,
-  /* free_list */         NULL,
-  /* large_exhausted_warned */ 0,
-  /* pool_exhausted_warned */  0,
+  NULL, 0, 0, 0, 0, 0, -1,
+  CAML_PLAT_MUTEX_INITIALIZER,
+  0, 0, NULL, 0, 0,
 };
 
 static caml_plat_mutex init_lock = CAML_PLAT_MUTEX_INITIALIZER;
@@ -98,8 +62,7 @@ static size_t round_up(size_t value, size_t align) {
   return (value + mask) & ~mask;
 }
 
-/* Parse an unsigned 64-bit byte count with optional k/M/G suffix. Returns 0
- * on parse failure (which the caller treats as "use the default"). */
+/* Parse a byte count with optional k/M/G suffix; 0 on failure. */
 static unsigned long long parse_size(const char* s) {
   if (s == NULL || *s == '\0') return 0;
   char* endp = NULL;
@@ -114,16 +77,6 @@ static unsigned long long parse_size(const char* s) {
   }
   return n;
 }
-
-#ifdef _WIN32
-
-void caml_dax_arena_init(void) {
-  caml_plat_lock_blocking(&init_lock);
-  arena.tried = 1;
-  caml_plat_unlock(&init_lock);
-}
-
-#else
 
 void caml_dax_arena_init(void) {
   caml_plat_lock_blocking(&init_lock);
@@ -164,9 +117,7 @@ void caml_dax_arena_init(void) {
   large = round_up(large, DAX_DEVICE_ALIGN);
 
   size_t pool_bytes = (size_t)Bsize_wsize(POOL_WSIZE);
-  /* Pools must tile 32 KiB aligned; the mmap base is 2 MiB aligned and
-   * `large` is rounded to 2 MiB, so the pool zone start is 2 MiB aligned,
-   * which is a multiple of pool_bytes. */
+  /* pool zone start = base + large; both are 2 MiB aligned, so divisible by pool_bytes */
   CAMLassert(pool_bytes != 0);
   CAMLassert(large % pool_bytes == 0);
 
@@ -188,11 +139,7 @@ void caml_dax_arena_init(void) {
   caml_plat_unlock(&init_lock);
 }
 
-#endif
-
 int caml_dax_arena_available(void) {
-  /* `available` is written once, before any reader can race; tearing-free
-   * read on all our supported architectures. */
   return arena.available;
 }
 

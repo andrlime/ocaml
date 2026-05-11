@@ -150,11 +150,8 @@ struct oldify_state {
   caml_domain_state* domain;
 };
 
-/* Week-4 arena selection: route all promotions to ARENA_FAR when
- * OCAML_FAR_ALL=1, otherwise always use ARENA_DRAM.  The reserved bits
- * (criticality hints) arrive in Week 5; the signature is already pinned. */
 static caml_arena_id choose_arena_week4(reserved_t reserved) {
-  (void)reserved; /* hint plumbing arrives in Week 5 */
+  (void)reserved; /* reserved-bit hints arrive in Week 5 */
   if (caml_far_all_promotions) return ARENA_FAR;
   return ARENA_DRAM;
 }
