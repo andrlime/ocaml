@@ -61,8 +61,10 @@ def main(csv_path, out_path):
         ax.bar(xs, ys, width=width, label=pol, color=plotting.policy_color(pol))
 
     ax.axhline(1.0, color="#666666", linewidth=1, linestyle="--")
-    ax.text(len(benches) - 0.5, 1.0, "all_dram, no pressure ",
-            va="bottom", ha="right", color="#666666", fontsize=10)
+    ax.text(len(benches) - 0.5, 1.0, "all_dram, no pressure",
+            va="bottom", ha="right", color="white", fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.25", facecolor="#444444",
+                      edgecolor="none", alpha=0.85))
     ax.set_xticks(range(len(benches)))
     ax.set_xticklabels(benches)
     ax.set_ylabel("wall time vs all-in-DRAM\n(1.0 = same, 2.0 = 2× slower)")
