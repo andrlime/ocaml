@@ -50,7 +50,7 @@ mkdir -p "$RESULTS" "$FIGDIR"
 
 run_py() { (cd "$HERE" && uv run python "$@"); }
 
-POLICIES=${POLICIES:-"all_dram all_far flat_far size_threshold:256 attribute"}
+POLICIES=${POLICIES:-"all_dram all_far flat_far size_threshold:32 attribute"}
 BENCHES=${BENCHES:-"ptrchase arraytraverse mixed"}
 # Cap points as a percentage of each benchmark's own footprint, so pressure is
 # comparable across workloads with very different sizes. 100 ~ fits in DRAM.

@@ -29,7 +29,7 @@
 set -eu
 
 DIR=$(dirname "$0")/benchmarks
-POLICIES=${POLICIES:-"all_dram all_far flat_far size_threshold:256 attribute"}
+POLICIES=${POLICIES:-"all_dram all_far flat_far size_threshold:32 attribute"}
 BENCHES=${BENCHES:-"ptrchase arraytraverse mixed"}
 CAPS=${CAPS:-0}
 REPS=${REPS:-10}
