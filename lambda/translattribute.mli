@@ -64,3 +64,9 @@ val add_function_attributes
   -> Location.t
   -> Parsetree.attributes
   -> Lambda.lambda
+
+(* Recognise the [@far_memory] / [@main_memory] placement hints on an
+   allocation, marking them used for the purpose of warning 53. *)
+val check_memory_hint_attributes
+   : Parsetree.attributes
+  -> unit

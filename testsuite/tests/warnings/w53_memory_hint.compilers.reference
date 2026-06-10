@@ -1,0 +1,9 @@
+File "w53_memory_hint.ml", line 21, characters 19-29:
+21 | let _const = (42 [@far_memory])             (* rejected: not an allocation *)
+                        ^^^^^^^^^^
+Warning 53 [misplaced-attribute]: the far_memory attribute cannot appear in this context
+
+File "w53_memory_hint.ml", line 22, characters 20-31:
+22 | let _ident x = (x [@main_memory])           (* rejected: not an allocation *)
+                         ^^^^^^^^^^^
+Warning 53 [misplaced-attribute]: the main_memory attribute cannot appear in this context

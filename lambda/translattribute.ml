@@ -381,3 +381,13 @@ let add_function_attributes lam loc attr =
     add_poll_attribute lam loc attr
   in
   lam
+
+(* The [@far_memory] / [@main_memory] placement hints steer where an allocation
+   is placed (see the [attribute] GC policy). Mark them used so a hint on an
+   allocation does not trip warning 53; a hint anywhere else stays unmarked and
+   is reported as misplaced. The hint is read back and threaded into the
+   allocation by a later pass. *)
+let check_memory_hint_attributes attrs =
+  let _ : bool = has_attribute "far_memory" attrs in
+  let _ : bool = has_attribute "main_memory" attrs in
+  ()

@@ -284,6 +284,7 @@ and transl_exp0 ~in_new_scope ~scopes e =
   | Texp_try(body, exn_pat_expr_list, eff_pat_expr_list) ->
       transl_handler ~scopes e body None exn_pat_expr_list eff_pat_expr_list
   | Texp_tuple el ->
+      Translattribute.check_memory_hint_attributes e.exp_attributes;
       let ll, shape = transl_list_with_shape ~scopes (List.map snd el) in
       begin try
         Lconst(Const_block(0, List.map extract_constant ll))
@@ -292,6 +293,7 @@ and transl_exp0 ~in_new_scope ~scopes e =
               (of_location ~scopes e.exp_loc))
       end
   | Texp_construct(_, cstr, args) ->
+      Translattribute.check_memory_hint_attributes e.exp_attributes;
       let ll, shape = transl_list_with_shape ~scopes args in
       if cstr.cstr_inlined <> None then begin match ll with
         | [x] -> x
@@ -319,6 +321,7 @@ and transl_exp0 ~in_new_scope ~scopes e =
   | Texp_extension_constructor (_, path) ->
       transl_extension_path (of_location ~scopes e.exp_loc) e.exp_env path
   | Texp_variant(l, arg) ->
+      Translattribute.check_memory_hint_attributes e.exp_attributes;
       let tag = Btype.hash_variant l in
       begin match arg with
         None -> Lconst(const_int tag)
@@ -333,6 +336,7 @@ and transl_exp0 ~in_new_scope ~scopes e =
                   of_location ~scopes e.exp_loc)
       end
   | Texp_record {fields; representation; extended_expression} ->
+      Translattribute.check_memory_hint_attributes e.exp_attributes;
       transl_record ~scopes e.exp_loc e.exp_env
         fields representation extended_expression
   | Texp_atomic_loc (arg, _, lbl) ->
@@ -384,6 +388,7 @@ and transl_exp0 ~in_new_scope ~scopes e =
       Lprim(access, [transl_exp ~scopes arg; transl_exp ~scopes newval],
             of_location ~scopes e.exp_loc)
   | Texp_array (amut, expr_list) ->
+      Translattribute.check_memory_hint_attributes e.exp_attributes;
       let kind = array_kind e in
       let ll = transl_list ~scopes expr_list in
       let loc = of_location ~scopes e.exp_loc in
