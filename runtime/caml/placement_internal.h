@@ -68,6 +68,10 @@ void caml_placement_record_minor(uintnat minor_words, uintnat promoted_words);
    wants it. */
 void caml_placement_after_minor(void);
 
+/* Number of choose_arena calls so far, for the per-decision overhead
+   measurement. Always 0 unless CAML_PLACEMENT_COUNT was set at startup. */
+uintnat caml_placement_decision_count(void);
+
 #endif /* CAML_INTERNALS */
 
 #endif /* CAML_PLACEMENT_INTERNAL_H */

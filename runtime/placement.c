@@ -47,6 +47,12 @@ static int after_minor_active = 0;
 static atomic_uintnat pending_minor_words;
 static atomic_uintnat pending_promoted_words;
 
+/* Count of choose_arena calls, for the per-decision overhead measurement. Off
+   unless CAML_PLACEMENT_COUNT is set, so timed runs stay uninstrumented: the
+   benchmark takes the count from a separate untimed run. */
+static int count_active = 0;
+static atomic_uintnat decision_count;
+
 /* The default tier: where objects live when a policy expresses no preference,
    and the backstop a buggy policy is clamped to. Tier 0 is local DRAM. */
 #define CAML_ARENA_DEFAULT CAML_ARENA_DRAM
@@ -271,6 +277,7 @@ static void install(const caml_placement_policy_ops *ops)
 {
   active_policy = ops;
   after_minor_active = ops->after_minor != NULL;
+  count_active = caml_secure_getenv(T("CAML_PLACEMENT_COUNT")) != NULL;
   caml_gc_log("placement: installed policy '%s'", ops->name);
 }
 
@@ -341,8 +348,15 @@ void caml_placement_fill(caml_placement_features *features, header_t hd,
 
 int caml_placement_choose(const caml_placement_features *features)
 {
+  if (count_active)
+    atomic_fetch_add_explicit(&decision_count, 1, memory_order_relaxed);
   int arena = clamp_arena(active_policy->choose_arena(features));
   return arena == CAML_ARENA_STAY ? CAML_ARENA_DEFAULT : arena;
+}
+
+uintnat caml_placement_decision_count(void)
+{
+  return atomic_load_relaxed(&decision_count);
 }
 
 value *caml_placement_alloc(struct caml_heap_state *heap, caml_domain_state *d,
