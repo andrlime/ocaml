@@ -27,8 +27,9 @@
  * the call -- it must emit the indirect call the engine emits.
  *
  * Build: cc -O2 -I <runtime> -I <runtime>/caml decisionbench.c -ldl -o ...
- * Run:   ./decisionbench [policy.so]      (default ./noop.so)
- * Output: CSV "path,ns_per_call" on stdout.
+ * Run:   ./decisionbench [policy.so] [reps]   (default ./noop.so 100)
+ * Output: CSV "path,rep,ns_per_call" on stdout -- one row per repetition per
+ * path, so the plot can show the spread.
  */
 
 #define _GNU_SOURCE
@@ -39,7 +40,7 @@
 #include <time.h>
 #include "caml/placement.h"
 
-#define ITERS 500000000UL
+#define ITERS 20000000UL
 
 /* A policy compiled into this binary -- the "built-in" case. Same trivial body
  * as the noop .so policy, so the two paths differ only in code location. */
@@ -83,17 +84,25 @@ static double time_dispatch(const caml_placement_policy_ops *volatile ops)
 int main(int argc, char **argv)
 {
   const char *so = argc > 1 ? argv[1] : "./noop.so";
+  long reps = argc > 2 ? atol(argv[2]) : 100;
 
-  printf("path,ns_per_call\n");
-  printf("builtin,%.3f\n", time_dispatch(&builtin_policy));
-
+  const caml_placement_policy_ops *sops = NULL;
   void *h = dlopen(so, RTLD_NOW);
   if (h != NULL) {
     caml_placement_entry_fn entry =
       (caml_placement_entry_fn) dlsym(h, "caml_placement_policy_entry");
-    printf("dlopen,%.3f\n", time_dispatch(entry()));
+    sops = entry();
   } else {
     fprintf(stderr, "decisionbench: cannot dlopen '%s'\n", so);
+  }
+
+  /* Interleave the two paths each rep so any drift in clock or frequency hits
+   * both equally. */
+  printf("path,rep,ns_per_call\n");
+  for (long r = 0; r < reps; r++) {
+    printf("builtin,%ld,%.3f\n", r, time_dispatch(&builtin_policy));
+    if (sops != NULL)
+      printf("dlopen,%ld,%.3f\n", r, time_dispatch(sops));
   }
   return 0;
 }

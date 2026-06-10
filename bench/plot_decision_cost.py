@@ -41,18 +41,27 @@ def main(csv_path, out_path):
     plotting.apply_style()
     df = pd.read_csv(csv_path)
     paths = [p for p in ORDER if p in set(df["path"])]
-    vals = [float(df[df.path == p]["ns_per_call"].iloc[0]) for p in paths]
 
+    meds, los, his = [], [], []
+    for p in paths:
+        v = df[df.path == p]["ns_per_call"]
+        m = float(v.median())
+        meds.append(m)
+        los.append(m - float(v.quantile(0.25)))
+        his.append(float(v.quantile(0.75)) - m)
+
+    n = int(df.groupby("path").size().max())
     fig, ax = plt.subplots(figsize=(9, 6))
-    bars = ax.bar([LABELS[p] for p in paths], vals,
-                  width=0.6, color=[COLORS[p] for p in paths])
-    for b, v in zip(bars, vals):
-        ax.text(b.get_x() + b.get_width() / 2, v, "%.1f ns" % v,
+    bars = ax.bar([LABELS[p] for p in paths], meds, width=0.6,
+                  color=[COLORS[p] for p in paths],
+                  yerr=[los, his], capsize=6)
+    for b, m, hi in zip(bars, meds, his):
+        ax.text(b.get_x() + b.get_width() / 2, m + hi, "%.2f ns" % m,
                 ha="center", va="bottom")
 
     ax.set_ylabel("time per decision (ns)")
-    ax.set_ylim(0, max(vals) * 1.25)
-    ax.set_title("Cost of one placement decision")
+    ax.set_ylim(0, max(m + h for m, h in zip(meds, his)) * 1.25)
+    ax.set_title("Cost of one placement decision (median of %d runs, IQR)" % n)
     plotting.save(fig, out_path)
 
 
