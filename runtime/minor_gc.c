@@ -696,6 +696,8 @@ caml_empty_minor_heap_promote(caml_domain_state* domain,
 
   domain->stat_minor_words += Wsize_bsize (minor_allocated_bytes);
   domain->stat_promoted_words += domain->allocated_words - prev_alloc_words;
+  caml_placement_record_minor(Wsize_bsize (minor_allocated_bytes),
+                              domain->allocated_words - prev_alloc_words);
 
   /* Must be called during the STW section -- before any mutators
      start running, so before arriving at the barrier. */
@@ -936,6 +938,11 @@ caml_stw_empty_minor_heap_no_major_slice(caml_domain_state* domain,
 #endif
 
   CAML_EV_END(EV_MINOR_CLEAR);
+
+  /* All domains have promoted by now; one of them reports the collection. */
+  if (participating[0] == domain)
+    caml_placement_after_minor();
+
   caml_gc_log("finished stw empty_minor_heap");
   CAMLassert(domain->young_ptr == domain->young_end);
 }

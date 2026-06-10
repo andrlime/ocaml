@@ -55,6 +55,19 @@ value *caml_placement_alloc(struct caml_heap_state *heap, caml_domain_state *d,
                             mlsize_t wosize, tag_t tag, reserved_t reserved,
                             uint8_t site);
 
+/* Add one domain's contribution to the in-progress minor collection's
+   telemetry: [minor_words] allocated in its minor heap and [promoted_words]
+   copied to the major heap. Called by each domain as it finishes promoting; a
+   no-op unless the active policy wants [after_minor], so an indifferent policy
+   pays only a predicted branch. */
+void caml_placement_record_minor(uintnat minor_words, uintnat promoted_words);
+
+/* Deliver the just-completed minor collection's stats to the active policy's
+   [after_minor] and reset the accumulators. Called once per collection, by a
+   single domain, after all domains have promoted; a no-op unless the policy
+   wants it. */
+void caml_placement_after_minor(void);
+
 #endif /* CAML_INTERNALS */
 
 #endif /* CAML_PLACEMENT_INTERNAL_H */

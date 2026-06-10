@@ -16,7 +16,9 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "caml/camlatomic.h"
 #include "caml/gc.h"
+#include "caml/minor_gc.h"
 #include "caml/misc.h"
 #include "caml/mlvalues.h"
 #include "caml/osdeps.h"
@@ -26,6 +28,15 @@
 /* Installed once by caml_placement_init before any domain spawns, then only
    read, so a plain pointer needs no synchronisation. */
 static const caml_placement_policy_ops *active_policy = NULL;
+
+/* True iff [active_policy] supplies [after_minor]. Gates the per-collection
+   accounting so a policy that ignores telemetry pays nothing for it. */
+static int after_minor_active = 0;
+
+/* Per-collection telemetry, summed across domains as they promote and read
+   (then reset) by the one domain that fires [after_minor]. */
+static atomic_uintnat pending_minor_words;
+static atomic_uintnat pending_promoted_words;
 
 /* The default tier: where objects live when a policy expresses no preference,
    and the backstop a buggy policy is clamped to. Tier 0 is local DRAM. */
@@ -160,6 +171,7 @@ static int looks_like_dynamic(const char *spec)
 static void install(const caml_placement_policy_ops *ops)
 {
   active_policy = ops;
+  after_minor_active = ops->after_minor != NULL;
   caml_gc_log("placement: installed policy '%s'", ops->name);
 }
 
@@ -242,4 +254,26 @@ value *caml_placement_alloc(struct caml_heap_state *heap, caml_domain_state *d,
   caml_placement_fill(&features, hd, d, site);
   int arena = caml_placement_choose(&features);
   return caml_shared_try_alloc_arena(heap, wosize, tag, reserved, arena);
+}
+
+void caml_placement_record_minor(uintnat minor_words, uintnat promoted_words)
+{
+  if (!after_minor_active) return;
+  atomic_fetch_add(&pending_minor_words, minor_words);
+  atomic_fetch_add(&pending_promoted_words, promoted_words);
+}
+
+void caml_placement_after_minor(void)
+{
+  if (!after_minor_active) return;
+
+  caml_placement_minor_stats stats;
+  memset(&stats, 0, sizeof stats);
+  stats.minor_words = atomic_exchange(&pending_minor_words, 0);
+  stats.promoted_words = atomic_exchange(&pending_promoted_words, 0);
+  /* promoted_blocks has no cheap source yet; left zero. */
+  stats.collection = atomic_load_relaxed(&caml_minor_collections_count);
+  caml_shared_arena_used(stats.arena_used);
+  caml_shared_arena_capacity(stats.arena_capacity);
+  active_policy->after_minor(&stats);
 }
