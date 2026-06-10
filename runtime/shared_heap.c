@@ -20,6 +20,7 @@
 #include <string.h>
 #include "caml/addrmap.h"
 #include "caml/custom.h"
+#include "caml/far_arena.h"
 #include "caml/runtime_events.h"
 #include "caml/fail.h"
 #include "caml/fiber.h" /* for verification */
@@ -251,12 +252,22 @@ void caml_free_shared_heap(struct caml_heap_state* heap) {
 
 /* Allocating and deallocating pools from the global freelist. */
 
+/* Fresh pool-sized backing memory for an arena. DRAM is mapped from the OS and
+   can later be unmapped; far memory is carved from the devdax region and is
+   never returned to the device. */
+static void* map_pool(int arena_id) {
+  uintnat bytes = Bsize_wsize(POOL_WSIZE);
+  if (arena_id == CAML_ARENA_FAR)
+    return caml_far_arena_alloc(bytes, bytes);
+  return caml_mem_map(bytes, 0);
+}
+
 static pool* pool_acquire(struct caml_heap_state* local, int arena_id) {
   pool* r;
 
   caml_plat_lock_blocking(&pool_freelist.lock);
   if (!pool_freelist.free[arena_id]) {
-    void* mem = caml_mem_map(Bsize_wsize(POOL_WSIZE), 0);
+    void* mem = map_pool(arena_id);
 
     if (mem) {
       CAMLassert(pool_freelist.free[arena_id] == NULL);
@@ -300,7 +311,16 @@ static void pool_free(struct caml_heap_state* local,
     CAMLassert(pool->sz == sz);
     local->stats.pool_words -= POOL_WSIZE;
     local->stats.pool_frag_words -= POOL_HEADER_WSIZE + padding_sizeclass[sz];
-    caml_mem_unmap(pool, Bsize_wsize(POOL_WSIZE));
+    if (pool->arena_id == CAML_ARENA_FAR) {
+      /* Far memory is never returned to the device; recycle the pool through
+         the global freelist instead of unmapping it. */
+      caml_plat_lock_blocking(&pool_freelist.lock);
+      pool->next = pool_freelist.free[CAML_ARENA_FAR];
+      pool_freelist.free[CAML_ARENA_FAR] = pool;
+      caml_plat_unlock(&pool_freelist.lock);
+    } else {
+      caml_mem_unmap(pool, Bsize_wsize(POOL_WSIZE));
+    }
 }
 
 static void calc_pool_stats(pool* a, sizeclass sz, struct heap_stats* s)
@@ -515,9 +535,12 @@ static void* pool_allocate(struct caml_heap_state* local, sizeclass sz,
 
 static void* large_allocate(struct caml_heap_state* local, mlsize_t sz,
                             int arena_id) {
-  large_alloc* a = malloc(sz + LARGE_ALLOC_HEADER_SZ);
+  uintnat bytes = sz + LARGE_ALLOC_HEADER_SZ;
+  large_alloc* a = arena_id == CAML_ARENA_FAR
+    ? caml_far_arena_alloc(bytes, Cache_line_bsize)
+    : malloc(bytes);
   if (!a) return NULL;
-  local->stats.large_words += Wsize_bsize(sz + LARGE_ALLOC_HEADER_SZ);
+  local->stats.large_words += Wsize_bsize(bytes);
   if (local->stats.large_words > local->stats.large_max_words)
     local->stats.large_max_words = local->stats.large_words;
   local->stats.large_blocks++;
@@ -528,8 +551,9 @@ static void* large_allocate(struct caml_heap_state* local, mlsize_t sz,
   return (char*)a + LARGE_ALLOC_HEADER_SZ;
 }
 
-value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
-                             tag_t tag, reserved_t reserved)
+value* caml_shared_try_alloc_arena(struct caml_heap_state* local,
+                                   mlsize_t wosize, tag_t tag,
+                                   reserved_t reserved, int arena_id)
 {
   mlsize_t whsize = Whsize_wosize(wosize);
   value* p;
@@ -543,14 +567,21 @@ value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
     struct heap_stats* s;
     sizeclass sz = sizeclass_whsize[whsize];
     CAMLassert(whsize_sizeclass[sz] >= whsize);
-    p = pool_allocate(local, sz, CAML_ARENA_DRAM);
+    p = pool_allocate(local, sz, arena_id);
+    /* A request the chosen arena cannot satisfy (e.g. far memory exhausted or
+       unavailable) falls back to DRAM, so allocation never fails for want of
+       far memory. */
+    if (!p && arena_id != CAML_ARENA_DRAM)
+      p = pool_allocate(local, sz, CAML_ARENA_DRAM);
     if (!p) return 0;
     s = &local->stats;
     s->pool_live_blocks++;
     s->pool_live_words += whsize;
     s->pool_frag_words += wfrag_whsize[whsize];
   } else {
-    p = large_allocate(local, Bsize_wsize(whsize), CAML_ARENA_DRAM);
+    p = large_allocate(local, Bsize_wsize(whsize), arena_id);
+    if (!p && arena_id != CAML_ARENA_DRAM)
+      p = large_allocate(local, Bsize_wsize(whsize), CAML_ARENA_DRAM);
     if (!p) return 0;
   }
   Hd_hp (p) = Make_header_with_reserved(wosize, tag,
@@ -569,6 +600,13 @@ value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
   }
 #endif
   return p;
+}
+
+value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
+                             tag_t tag, reserved_t reserved)
+{
+  return caml_shared_try_alloc_arena(local, wosize, tag, reserved,
+                                     CAML_ARENA_DRAM);
 }
 
 /* Sweeping of the major heap shared pools */
@@ -707,6 +745,12 @@ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
   return work;
 }
 
+/* Release the backing of a large allocation. DRAM blocks come from malloc;
+   far blocks are device memory and are never reclaimed. */
+static void large_free(large_alloc* a) {
+  if (a->arena_id != CAML_ARENA_FAR) free(a);
+}
+
 /* Sweep one large block. Returns the block's size. */
 
 static intnat large_alloc_sweep(struct caml_heap_state* local, int arena_id) {
@@ -732,7 +776,7 @@ static intnat large_alloc_sweep(struct caml_heap_state* local, int arena_id) {
     local->owner->swept_words +=
       Whsize_hd(hd) + Wsize_bsize(LARGE_ALLOC_HEADER_SZ);
     local->stats.large_blocks--;
-    free(a);
+    large_free(a);
   } else {
     a->next = local->arenas[arena_id].swept_large;
     local->arenas[arena_id].swept_large = a;
@@ -755,7 +799,7 @@ static void large_alloc_finalise(struct caml_heap_state* local, int arena_id) {
       void (*final_fun)(value) = Custom_ops_val(Val_hp(p))->finalize;
       if (final_fun != NULL) final_fun(Val_hp(p));
     }
-    free(a);
+    large_free(a);
   }
 }
 

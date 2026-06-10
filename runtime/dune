@@ -48,7 +48,7 @@
      gc_ctrl.c  md5.c obj.c
    lexing.c callback.c debugger.c weak.c compact.c finalise.c custom.c dynlink.c
    afl.c unix.c win32.c bigarray.c main.c memprof.c domain.c
-   skiplist.c codefrag.c placement.c
+   skiplist.c codefrag.c placement.c far_arena.c
  )
  (action
    (progn
