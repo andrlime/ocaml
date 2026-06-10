@@ -14,11 +14,11 @@
 
 """Figure F3: one placement decision costs a couple of nanoseconds.
 
-Reads decisionbench output (path,ns_per_call) and draws the cost of calling the
-policy three ways: inlinable (the floor), through a function pointer (the
-built-in dispatch), and through a dlopen'd .so (the loadable path). The bars
-being a few ns -- and dlopen barely above the built-in -- is the point:
-programmability is effectively free per object.
+Reads decisionbench output (path,ns_per_call). Both bars call a policy through
+its ops table -- the exact indirection the engine performs -- differing only in
+where the policy lives: compiled into the binary (built-in) vs loaded from a
+.so (dlopen). They are equal at a couple of ns, so making placement
+programmable via a loadable policy costs nothing per object.
 
     python plot_decision_cost.py decision.csv decision_cost.png
 """
@@ -30,12 +30,11 @@ import matplotlib.pyplot as plt
 import plotting
 
 LABELS = {
-    "inlinable": "inlinable\n(floor)",
-    "indirect": "function pointer\n(built-in)",
+    "builtin": "built-in\n(compiled in)",
     "dlopen": "dlopen .so\n(loadable)",
 }
-COLORS = {"inlinable": "#949494", "indirect": "#029E73", "dlopen": "#0173B2"}
-ORDER = ["inlinable", "indirect", "dlopen"]
+COLORS = {"builtin": "#029E73", "dlopen": "#0173B2"}
+ORDER = ["builtin", "dlopen"]
 
 
 def main(csv_path, out_path):
