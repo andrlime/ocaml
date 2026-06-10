@@ -1244,6 +1244,7 @@ runtime_COMMON_C_SOURCES = \
   misc \
   obj \
   parsing \
+  placement \
   platform \
   printexc \
   prng \

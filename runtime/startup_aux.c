@@ -29,6 +29,7 @@
 #include "caml/callback.h"
 #include "caml/domain.h"
 #include "caml/major_gc.h"
+#include "caml/placement_internal.h"
 #ifndef NATIVE_CODE
 #include "caml/dynlink.h"
 #endif
@@ -247,6 +248,7 @@ CAMLexport void caml_shutdown(void)
     caml_domain_terminate(true);
     caml_finalise_freelist();
   }
+  caml_placement_shutdown();
   caml_free_gc_stats();
   caml_free_locale();
 #ifndef NATIVE_CODE
