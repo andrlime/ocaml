@@ -33,11 +33,18 @@ set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/.." && pwd)
 FAR_DEVICE=${FAR_DEVICE:-/dev/dax1.0}
-SIZE=${SIZE:-4000000}
-REPS=${REPS:-10}
-CAPS=${CAPS:-"0 64000000 32000000 16000000 8000000"}
+SIZE=${SIZE:-2000000}
+REPS=${REPS:-5}
+CAPS=${CAPS:-"0 16000000 4000000"}
 FIGDIR=${FIGDIR:-$HOME/figures}
 RESULTS="$HERE/results"
+
+# This is a real sweep: 5 policies x 3 benchmarks x caps x reps, and far-memory
+# runs are slow (millions of dependent far-latency loads each). The defaults
+# above are ~225 runs; on real devdax expect tens of minutes. Sanity-check
+# first with a tiny, fast pass:
+#   SIZE=300000 REPS=2 CAPS=0 sh make_figures.sh
+# run.sh prints [cell/total] progress to stderr so you can see it moving.
 
 export CAML_FAR_DEVICE="$FAR_DEVICE"
 mkdir -p "$RESULTS" "$FIGDIR"

@@ -35,6 +35,13 @@ CAPS=${CAPS:-0}
 REPS=${REPS:-10}
 SIZE=${SIZE:-2000000}
 
+# Count cells so progress can show how far along we are.
+ncap=$(echo "$CAPS" | wc -w)
+nbench=$(echo "$BENCHES" | wc -w)
+npol=$(echo "$POLICIES" | wc -w)
+total=$((nbench * npol * ncap))
+cell=0
+
 # Header once, from any benchmark.
 first=$(echo "$BENCHES" | cut -d' ' -f1)
 "$DIR/$first" --header
@@ -42,6 +49,9 @@ first=$(echo "$BENCHES" | cut -d' ' -f1)
 for bench in $BENCHES; do
   for policy in $POLICIES; do
     for cap in $CAPS; do
+      cell=$((cell + 1))
+      printf '[%d/%d] %s %s cap=%s x%s reps\n' \
+        "$cell" "$total" "$bench" "$policy" "$cap" "$REPS" >&2
       rep=0
       while [ "$rep" -lt "$REPS" ]; do
         BENCH_SIZE="$SIZE" BENCH_REP="$rep" \
