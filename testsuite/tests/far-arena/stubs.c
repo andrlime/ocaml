@@ -24,3 +24,11 @@ CAMLprim value far_arena_place(value words)
     Field(Val_hp(p), i) = Val_unit;
   return Val_int(caml_far_arena_contains(p) ? 1 : 2);
 }
+
+/* Words of backing currently committed to the given arena. */
+CAMLprim value far_arena_used(value arena)
+{
+  uintnat used[CAML_ARENA_COUNT];
+  caml_shared_arena_used(used);
+  return Val_long(used[Long_val(arena)]);
+}

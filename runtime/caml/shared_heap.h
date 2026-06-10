@@ -25,6 +25,7 @@
 #include "misc.h"
 #include "gc_stats.h"
 #include "major_gc.h"
+#include "placement.h"
 
 CAMLextern atomic_uintnat caml_compactions_count;
 
@@ -63,6 +64,14 @@ void caml_accum_orphan_heap_stats(struct heap_stats *acc);
 uintnat caml_heap_size(struct caml_heap_state*);
 uintnat caml_top_heap_words(struct caml_heap_state*);
 uintnat caml_heap_blocks(struct caml_heap_state*);
+
+/* Per-arena accounting, aggregated across all domains and indexed by
+   CAML_ARENA_* (see caml/placement.h). [caml_shared_arena_used] reports the
+   words of pool and large-object backing currently committed to each arena;
+   [caml_shared_arena_capacity] reports each arena's ceiling in words, with 0
+   meaning unbounded (DRAM). */
+void caml_shared_arena_used(uintnat used[CAML_ARENA_COUNT]);
+void caml_shared_arena_capacity(uintnat capacity[CAML_ARENA_COUNT]);
 
 void caml_compact_heap(caml_domain_state* domain_state,
                          int participating_count,

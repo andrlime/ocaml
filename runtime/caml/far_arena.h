@@ -42,6 +42,9 @@ void *caml_far_arena_alloc(uintnat bytes, uintnat align);
 /* Whether [p] lies within the mapped far region. */
 int caml_far_arena_contains(const void *p);
 
+/* The number of bytes mapped for the far arena, or 0 if it is unavailable. */
+uintnat caml_far_arena_capacity(void);
+
 #endif /* CAML_INTERNALS */
 
 #endif /* CAML_FAR_ARENA_H */

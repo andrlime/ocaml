@@ -27,6 +27,7 @@ void *caml_far_arena_alloc(uintnat bytes, uintnat align)
   return NULL;
 }
 int caml_far_arena_contains(const void *p) { (void) p; return 0; }
+uintnat caml_far_arena_capacity(void) { return 0; }
 
 #else
 
@@ -142,6 +143,12 @@ int caml_far_arena_contains(const void *p)
   return far.status == FAR_READY
       && (const char *)p >= far.base
       && (const char *)p < far.base + far.capacity;
+}
+
+uintnat caml_far_arena_capacity(void)
+{
+  ensure_initialised();
+  return far.status == FAR_READY ? far.capacity : 0;
 }
 
 #endif /* _WIN32 */

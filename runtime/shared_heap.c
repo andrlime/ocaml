@@ -94,6 +94,13 @@ static struct {
   { NULL, }
 };
 
+/* Words of pool and large-object backing currently committed to each arena,
+   across all domains. Updated only when backing is mapped/unmapped (pools) or a
+   large object is allocated/freed, never when pools change owner, so it is a
+   stable measure of how much memory each tier holds. Far memory is never
+   returned to the device, so its count only grows. */
+static atomic_uintnat arena_committed_words[CAML_ARENA_COUNT];
+
 /* The pools and large allocations a domain holds in one memory arena. */
 struct caml_arena {
   pool* avail_pools[NUM_SIZECLASSES];
@@ -277,6 +284,7 @@ static pool* pool_acquire(struct caml_heap_state* local, int arena_id) {
       r->owner = NULL;
       r->arena_id = arena_id;
       pool_freelist.free[arena_id] = r;
+      atomic_fetch_add(&arena_committed_words[arena_id], POOL_WSIZE);
     }
   }
   r = pool_freelist.free[arena_id];
@@ -320,6 +328,7 @@ static void pool_free(struct caml_heap_state* local,
       caml_plat_unlock(&pool_freelist.lock);
     } else {
       caml_mem_unmap(pool, Bsize_wsize(POOL_WSIZE));
+      atomic_fetch_sub(&arena_committed_words[CAML_ARENA_DRAM], POOL_WSIZE);
     }
 }
 
@@ -540,6 +549,7 @@ static void* large_allocate(struct caml_heap_state* local, mlsize_t sz,
     ? caml_far_arena_alloc(bytes, Cache_line_bsize)
     : malloc(bytes);
   if (!a) return NULL;
+  atomic_fetch_add(&arena_committed_words[arena_id], Wsize_bsize(bytes));
   local->stats.large_words += Wsize_bsize(bytes);
   if (local->stats.large_words > local->stats.large_max_words)
     local->stats.large_max_words = local->stats.large_words;
@@ -748,7 +758,11 @@ static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
 /* Release the backing of a large allocation. DRAM blocks come from malloc;
    far blocks are device memory and are never reclaimed. */
 static void large_free(large_alloc* a) {
-  if (a->arena_id != CAML_ARENA_FAR) free(a);
+  if (a->arena_id == CAML_ARENA_FAR) return;
+  header_t hd = Hd_hp((char*)a + LARGE_ALLOC_HEADER_SZ);
+  uintnat words = Whsize_hd(hd) + Wsize_bsize(LARGE_ALLOC_HEADER_SZ);
+  atomic_fetch_sub(&arena_committed_words[CAML_ARENA_DRAM], words);
+  free(a);
 }
 
 /* Sweep one large block. Returns the block's size. */
@@ -908,6 +922,16 @@ uintnat caml_top_heap_words(struct caml_heap_state* local) {
 
 uintnat caml_heap_blocks(struct caml_heap_state* local) {
   return local->stats.pool_live_blocks + local->stats.large_blocks;
+}
+
+void caml_shared_arena_used(uintnat used[CAML_ARENA_COUNT]) {
+  for (int a = 0; a < CAML_ARENA_COUNT; a++)
+    used[a] = atomic_load_relaxed(&arena_committed_words[a]);
+}
+
+void caml_shared_arena_capacity(uintnat capacity[CAML_ARENA_COUNT]) {
+  capacity[CAML_ARENA_DRAM] = 0;   /* DRAM is bounded only by system memory */
+  capacity[CAML_ARENA_FAR] = Wsize_bsize(caml_far_arena_capacity());
 }
 
 void caml_redarken_pool(struct pool* r, scanning_action f, void* fdata) {
@@ -1629,8 +1653,9 @@ void caml_compact_heap(caml_domain_state* domain_state,
     pool* cur_pool = pool_freelist.free[CAML_ARENA_DRAM];
     while( cur_pool ) {
       pool* next_pool = cur_pool->next;
-      /* No stats to update so just unmap */
+      /* No heap stats to update, just unmap and uncommit */
       caml_mem_unmap(cur_pool, Bsize_wsize(POOL_WSIZE));
+      atomic_fetch_sub(&arena_committed_words[CAML_ARENA_DRAM], POOL_WSIZE);
       cur_pool = next_pool;
     }
     pool_freelist.free[CAML_ARENA_DRAM] = NULL;
