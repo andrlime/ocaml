@@ -30,6 +30,7 @@
 #include "caml/memory.h"
 #include "caml/memprof.h"
 #include "caml/mlvalues.h"
+#include "caml/osdeps.h"
 #include "caml/placement.h"
 #include "caml/platform.h"
 #include "caml/roots.h"
@@ -100,6 +101,46 @@ static struct {
    stable measure of how much memory each tier holds. Far memory is never
    returned to the device, so its count only grows. */
 static atomic_uintnat arena_committed_words[CAML_ARENA_COUNT];
+
+/* A soft cap on DRAM backing, read once from CAML_DRAM_CAP_WORDS (0 =
+   unlimited). When set and far memory is available, the heap stops committing
+   new DRAM past the cap, so allocations spill to far -- the memory-pressure
+   knob for the placement evaluation. It only bites while far has room to take
+   the overflow, so it never turns a serviceable allocation into a failure in
+   the common case. */
+static uintnat dram_cap_words = 0;
+static atomic_uintnat dram_cap_read = 0;
+
+static void ensure_dram_cap(void)
+{
+  if (atomic_load_acquire(&dram_cap_read)) return;
+  /* Idempotent: a race just reads the same value twice. */
+  char_os *spec = caml_secure_getenv(T("CAML_DRAM_CAP_WORDS"));
+  uintnat cap = 0;
+  if (spec != NULL) {
+    char *s = caml_stat_strdup_of_os(spec);
+    cap = (uintnat) strtoull(s, NULL, 0);
+    caml_stat_free(s);
+  }
+  dram_cap_words = cap;
+  atomic_store_release(&dram_cap_read, 1);
+}
+
+/* Whether a new [words]-word DRAM commitment should be refused so the request
+   spills to far. Only true with a cap set and far memory available, keeping the
+   no-fail invariant whenever far has capacity. */
+static int dram_over_cap(uintnat words)
+{
+  return dram_cap_words != 0
+      && caml_far_arena_available()
+      && atomic_load(&arena_committed_words[CAML_ARENA_DRAM]) + words
+           > dram_cap_words;
+}
+
+Caml_inline int other_arena(int arena_id)
+{
+  return arena_id == CAML_ARENA_DRAM ? CAML_ARENA_FAR : CAML_ARENA_DRAM;
+}
 
 /* The pools and large allocations a domain holds in one memory arena. */
 struct caml_arena {
@@ -272,8 +313,13 @@ static void* map_pool(int arena_id) {
 static pool* pool_acquire(struct caml_heap_state* local, int arena_id) {
   pool* r;
 
+  ensure_dram_cap();
   caml_plat_lock_blocking(&pool_freelist.lock);
-  if (!pool_freelist.free[arena_id]) {
+  /* Commit a fresh pool only if the freelist is empty and -- for DRAM -- the
+     cap leaves room; otherwise return NULL so the caller spills to the other
+     arena. Reusing a freelisted pool is always allowed: it adds no backing. */
+  if (!pool_freelist.free[arena_id]
+      && !(arena_id == CAML_ARENA_DRAM && dram_over_cap(POOL_WSIZE))) {
     void* mem = map_pool(arena_id);
 
     if (mem) {
@@ -545,7 +591,11 @@ static void* pool_allocate(struct caml_heap_state* local, sizeclass sz,
 static void* large_allocate(struct caml_heap_state* local, mlsize_t sz,
                             int arena_id) {
   uintnat bytes = sz + LARGE_ALLOC_HEADER_SZ;
-  large_alloc* a = arena_id == CAML_ARENA_FAR
+  large_alloc* a;
+  ensure_dram_cap();
+  if (arena_id == CAML_ARENA_DRAM && dram_over_cap(Wsize_bsize(bytes)))
+    return NULL;
+  a = arena_id == CAML_ARENA_FAR
     ? caml_far_arena_alloc(bytes, Cache_line_bsize)
     : malloc(bytes);
   if (!a) return NULL;
@@ -578,11 +628,11 @@ value* caml_shared_try_alloc_arena(struct caml_heap_state* local,
     sizeclass sz = sizeclass_whsize[whsize];
     CAMLassert(whsize_sizeclass[sz] >= whsize);
     p = pool_allocate(local, sz, arena_id);
-    /* A request the chosen arena cannot satisfy (e.g. far memory exhausted or
-       unavailable) falls back to DRAM, so allocation never fails for want of
-       far memory. */
-    if (!p && arena_id != CAML_ARENA_DRAM)
-      p = pool_allocate(local, sz, CAML_ARENA_DRAM);
+    /* A request the chosen arena cannot satisfy -- far memory exhausted or
+       unavailable, or DRAM held back by its cap -- falls back to the other
+       arena, so allocation never fails while either tier has room. */
+    if (!p)
+      p = pool_allocate(local, sz, other_arena(arena_id));
     if (!p) return 0;
     s = &local->stats;
     s->pool_live_blocks++;
@@ -590,8 +640,8 @@ value* caml_shared_try_alloc_arena(struct caml_heap_state* local,
     s->pool_frag_words += wfrag_whsize[whsize];
   } else {
     p = large_allocate(local, Bsize_wsize(whsize), arena_id);
-    if (!p && arena_id != CAML_ARENA_DRAM)
-      p = large_allocate(local, Bsize_wsize(whsize), CAML_ARENA_DRAM);
+    if (!p)
+      p = large_allocate(local, Bsize_wsize(whsize), other_arena(arena_id));
     if (!p) return 0;
   }
   Hd_hp (p) = Make_header_with_reserved(wosize, tag,
