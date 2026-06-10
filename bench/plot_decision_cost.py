@@ -12,52 +12,48 @@
 #*                                                                        *
 #**************************************************************************
 
-"""Figure F3: a placement decision costs a few nanoseconds.
+"""Figure F3: one placement decision costs a couple of nanoseconds.
 
-Reads a CSV with two conditions that make the *same* decisions and the same
-(all-DRAM) placement: the static built-in policy and the identical logic loaded
-via dlopen. Each makes the same number of decisions on a given benchmark, so
-(wall_dlopen - wall_static) / decisions is the marginal cost of one placement
-decision through the indirect (dlopen) path -- a direct, baseline-free measure
-of how cheap a decision is. One bar per benchmark.
+Reads decisionbench output (path,ns_per_call) and draws the cost of calling the
+policy three ways: inlinable (the floor), through a function pointer (the
+built-in dispatch), and through a dlopen'd .so (the loadable path). The bars
+being a few ns -- and dlopen barely above the built-in -- is the point:
+programmability is effectively free per object.
 
     python plot_decision_cost.py decision.csv decision_cost.png
-
-Expects policy values "static" and "dlopen" and a populated decision_count
-(runs collected with CAML_PLACEMENT_COUNT set).
 """
 
 import sys
+import pandas as pd
 import matplotlib.pyplot as plt
 
 import plotting
 
+LABELS = {
+    "inlinable": "inlinable\n(floor)",
+    "indirect": "function pointer\n(built-in)",
+    "dlopen": "dlopen .so\n(loadable)",
+}
+COLORS = {"inlinable": "#949494", "indirect": "#029E73", "dlopen": "#0173B2"}
+ORDER = ["inlinable", "indirect", "dlopen"]
+
 
 def main(csv_path, out_path):
     plotting.apply_style()
-    df = plotting.load_placement(csv_path)
-    wall = plotting.median_by(df, ["bench", "policy"], "wall_ms")
-    dec = plotting.median_by(df, ["bench", "policy"], "decision_count")
-    med = wall.merge(dec, on=["bench", "policy"])
-    benches = sorted(med["bench"].unique())
+    df = pd.read_csv(csv_path)
+    paths = [p for p in ORDER if p in set(df["path"])]
+    vals = [float(df[df.path == p]["ns_per_call"].iloc[0]) for p in paths]
 
-    ns_per = []
-    for b in benches:
-        st = med[(med.bench == b) & (med.policy == "static")]
-        dl = med[(med.bench == b) & (med.policy == "dlopen")]
-        if not len(st) or not len(dl) or dl["decision_count"].iloc[0] == 0:
-            ns_per.append(float("nan"))
-            continue
-        delta_ms = float(dl["wall_ms"].iloc[0]) - float(st["wall_ms"].iloc[0])
-        ns_per.append(delta_ms * 1e6 / float(dl["decision_count"].iloc[0]))
+    fig, ax = plt.subplots(figsize=(9, 6))
+    bars = ax.bar([LABELS[p] for p in paths], vals,
+                  width=0.6, color=[COLORS[p] for p in paths])
+    for b, v in zip(bars, vals):
+        ax.text(b.get_x() + b.get_width() / 2, v, "%.1f ns" % v,
+                ha="center", va="bottom")
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(benches, ns_per, width=0.55, color="#0173B2")
-    for i, v in enumerate(ns_per):
-        if v == v:  # not NaN
-            ax.text(i, v, "%.1f" % v, ha="center", va="bottom")
-    ax.set_ylabel("ns per decision (dlopen vs static)")
-    ax.set_title("Marginal cost of one placement decision")
+    ax.set_ylabel("time per decision (ns)")
+    ax.set_ylim(0, max(vals) * 1.25)
+    ax.set_title("Cost of one placement decision")
     plotting.save(fig, out_path)
 
 

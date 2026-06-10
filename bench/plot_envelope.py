@@ -28,26 +28,37 @@ import plotting
 def main(csv_path, out_path):
     plotting.apply_style()
     df = plotting.load_placement(csv_path)
-    cap = plotting.most_pressure_cap(df)
-    df = df[df["dram_cap"] == cap]
-    med = plotting.median_by(df, ["bench", "policy"])
-
-    benches = sorted(med["bench"].unique())
+    med = plotting.median_by(df, ["bench", "policy", "dram_cap"])
+    benches = sorted(df["bench"].unique())
     pair = ["all_dram", "all_far"]
 
-    fig, ax = plt.subplots(figsize=(11, 6))
+    def wall(b, pol):
+        # Loosest cap, so the bookends reflect pure placement, not a cap.
+        cap = plotting.nearest_cap(df, b, 1.0)
+        row = med[(med.bench == b) & (med.policy == pol)
+                  & (med.dram_cap == cap)]["wall_ms"]
+        return float(row.iloc[0]) if len(row) else float("nan")
+
+    fig, ax = plt.subplots(figsize=(11, 6.5))
     width = 0.36
+    series = {}
     for i, pol in enumerate(pair):
-        ys = [float(med[(med.bench == b) & (med.policy == pol)]["wall_ms"]
-                    .iloc[0]) for b in benches]
+        ys = [wall(b, pol) for b in benches]
+        series[pol] = ys
         xs = [j + (i - 0.5) * width for j in range(len(benches))]
         ax.bar(xs, ys, width=width, label=pol, color=plotting.policy_color(pol))
+
+    # Annotate how much slower all_far is than all_dram for each benchmark.
+    for j, b in enumerate(benches):
+        lo, hi = series["all_dram"][j], series["all_far"][j]
+        if lo and lo == lo:
+            ax.text(j, hi, "all_far %.2f×" % (hi / lo),
+                    ha="center", va="bottom", fontsize=10)
 
     ax.set_xticks(range(len(benches)))
     ax.set_xticklabels(benches)
     ax.set_ylabel("wall time (ms)")
-    ax.set_title("Upper bound vs naive control (DRAM cap: %s)"
-                 % plotting.cap_label(cap))
+    ax.set_title("The placement envelope: all-DRAM vs all-far")
     ax.legend(title=None)
     plotting.save(fig, out_path)
 

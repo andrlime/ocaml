@@ -28,12 +28,11 @@ import plotting
 def main(csv_path, out_path, bench=None):
     plotting.apply_style()
     df = plotting.load_placement(csv_path)
-    # Unbounded DRAM if available: each policy then places by its own logic,
-    # so the arena split reflects the policy and not a cap forcing spills.
-    caps = set(df["dram_cap"].unique())
-    cap = 0 if 0 in caps else plotting.most_pressure_cap(df)
     if bench is None:
         bench = plotting.default_bench(df)
+    # Loosest cap (fits in DRAM): each policy then places by its own logic, so
+    # the arena split reflects the policy and not a cap forcing spills.
+    cap = plotting.nearest_cap(df, bench, 1.0)
     df = df[(df["dram_cap"] == cap) & (df["bench"] == bench)]
 
     med = plotting.median_by(df, ["policy"], "dram_committed").merge(
@@ -51,8 +50,7 @@ def main(csv_path, out_path, bench=None):
            color=plotting.tier_color("far"))
 
     ax.set_ylabel("committed (M words)")
-    ax.set_title("Arena occupancy by policy (%s, DRAM cap: %s)"
-                 % (bench, plotting.cap_label(cap)))
+    ax.set_title("Where each policy puts %s's objects" % bench)
     ax.legend(title=None)
     plotting.save(fig, out_path)
 

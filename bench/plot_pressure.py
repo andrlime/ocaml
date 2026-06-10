@@ -12,10 +12,12 @@
 #*                                                                        *
 #**************************************************************************
 
-"""Figure F5: the win grows as DRAM gets scarcer. For one benchmark, slowdown
-vs the unbounded all_dram baseline as the DRAM cap tightens, one line per
-policy. The naive all_far stays flat-bad; criticality-aware policies degrade
-gently, so the gap widens with pressure.
+"""Figure F5: the advantage of criticality-aware placement grows as DRAM gets
+scarcer. For one benchmark, wall time relative to fitting entirely in DRAM, as
+the DRAM cap tightens from 100% of the footprint down. The naive all_far is
+flat and slow; all_dram degrades because it spills arbitrarily once DRAM is
+full; flat_far/attribute spill the right objects and degrade gently -- the gap
+widens with pressure.
 
     python plot_pressure.py placement.csv pressure.png [bench]
 """
@@ -34,32 +36,30 @@ def main(csv_path, out_path, bench=None):
     df = df[df["bench"] == bench]
     med = plotting.median_by(df, ["policy", "dram_cap"])
 
-    # Baseline: unbounded all_dram (cap 0 = no cap).
-    base_row = med[(med.policy == "all_dram") & (med.dram_cap == 0)]["wall_ms"]
-    base = float(base_row.iloc[0]) if len(base_row) else \
-        float(med["wall_ms"].min())
+    # Baseline: the loosest cap (largest footprint fraction) -- fits in DRAM.
+    fracs = {c: plotting.cap_fraction(df, bench, c)
+             for c in med["dram_cap"].unique()}
+    loosest = max(fracs, key=lambda c: fracs[c])
+    base_row = med[(med.policy == "all_dram") & (med.dram_cap == loosest)]
+    base = float(base_row["wall_ms"].iloc[0])
 
-    # x axis: caps from largest (least pressure) to smallest (most), with 0
-    # plotted as the largest since it means "unbounded".
-    caps = sorted(c for c in med["dram_cap"].unique() if c != 0)
     policies = plotting.ordered_policies(med["policy"].unique())
-
-    fig, ax = plt.subplots(figsize=(11, 6))
+    fig, ax = plt.subplots(figsize=(11, 6.5))
     for pol in policies:
-        xs, ys = [], []
-        for c in caps:
+        pts = []
+        for c in med[med.policy == pol]["dram_cap"].unique():
             row = med[(med.policy == pol) & (med.dram_cap == c)]["wall_ms"]
-            if len(row):
-                xs.append(c / 1e6)
-                ys.append(float(row.iloc[0]) / base)
-        if xs:
+            pts.append((fracs[c] * 100, float(row.iloc[0]) / base))
+        pts.sort()
+        if pts:
+            xs, ys = zip(*pts)
             ax.plot(xs, ys, marker="o", label=pol,
                     color=plotting.policy_color(pol))
 
-    ax.invert_xaxis()  # tighter cap (more pressure) to the right
+    ax.invert_xaxis()  # more pressure to the right
     ax.axhline(1.0, color="#666666", linewidth=1, linestyle="--")
-    ax.set_xlabel("DRAM cap (M words)  -- pressure increases right")
-    ax.set_ylabel("slowdown vs unbounded all_dram")
+    ax.set_xlabel("DRAM cap (% of footprint)   --   pressure increases →")
+    ax.set_ylabel("wall time vs all-in-DRAM\n(1.0 = same, 2.0 = 2× slower)")
     ax.set_title("Sensitivity to DRAM pressure (%s)" % bench)
     ax.legend(title=None)
     plotting.save(fig, out_path)

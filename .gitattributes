@@ -252,3 +252,7 @@ testsuite/tests/translprim/module_coercion.ml text eol=lf
 # This is forced to \n to allow the Cygwin testsuite to pass on a
 # Windows-checkout
 testsuite/tests/parsetree/locations_test.ml text eol=lf
+
+# Evaluation plot scripts use Unicode (×, →) in figure labels on purpose --
+# they render nicer than ASCII fallbacks. Exempt them from the typo checks.
+bench/*.py               typo.non-ascii=may typo.long-line=may typo.very-long-line=may

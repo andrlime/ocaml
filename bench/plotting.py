@@ -69,6 +69,29 @@ def default_bench(df):
     benches = set(df["bench"].unique())
     return "mixed" if "mixed" in benches else sorted(benches)[0]
 
+
+def footprint(df, bench):
+    """A benchmark's total live footprint in words: the most memory it ever
+    commits across the two arenas (reached at the loosest cap)."""
+    rows = df[df["bench"] == bench]
+    return float((rows["dram_committed"] + rows["far_committed"]).max())
+
+
+def cap_fraction(df, bench, cap):
+    """A cap as a fraction of [bench]'s footprint (1.0 = fits entirely in DRAM,
+    smaller = more pressure). cap 0 (unbounded) maps to 1.0."""
+    fp = footprint(df, bench)
+    if fp == 0:
+        return 1.0
+    return 1.0 if cap == 0 else cap / fp
+
+
+def nearest_cap(df, bench, target_fraction):
+    """The cap for [bench] whose fraction is closest to [target_fraction]."""
+    caps = df[df["bench"] == bench]["dram_cap"].unique()
+    return min(caps, key=lambda c: abs(cap_fraction(df, bench, c)
+                                       - target_fraction))
+
 # seaborn "colorblind" palette, assigned semantically and kept stable so a
 # policy/tier is the same colour in every figure.
 POLICY_COLORS = {

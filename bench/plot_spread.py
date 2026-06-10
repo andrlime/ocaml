@@ -27,35 +27,46 @@ import matplotlib.pyplot as plt
 import plotting
 
 
+TARGET_FRACTION = 0.5   # cap each benchmark to ~half its footprint
+
+
 def main(csv_path, out_path):
     plotting.apply_style()
     df = plotting.load_placement(csv_path)
-    cap = plotting.most_pressure_cap(df)
-    df = df[df["dram_cap"] == cap]
-    med = plotting.median_by(df, ["bench", "policy"])
+    benches = sorted(df["bench"].unique())
+    med = plotting.median_by(df, ["bench", "policy", "dram_cap"])
 
-    benches = sorted(med["bench"].unique())
+    # Baseline per bench: all_dram at the loosest cap (fits in DRAM).
+    def baseline(b):
+        loose = plotting.nearest_cap(df, b, 1.0)
+        row = med[(med.bench == b) & (med.policy == "all_dram")
+                  & (med.dram_cap == loose)]["wall_ms"]
+        return float(row.iloc[0])
+
+    bases = {b: baseline(b) for b in benches}
     policies = plotting.ordered_policies(med["policy"].unique())
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(12, 6.5))
     n = len(policies)
     width = 0.8 / n
     for i, pol in enumerate(policies):
         ys = []
         for b in benches:
-            base = med[(med.bench == b) & (med.policy == "all_dram")]["wall_ms"]
-            cur = med[(med.bench == b) & (med.policy == pol)]["wall_ms"]
-            ys.append(float(cur.iloc[0]) / float(base.iloc[0])
-                      if len(cur) and len(base) else float("nan"))
+            cap = plotting.nearest_cap(df, b, TARGET_FRACTION)
+            cur = med[(med.bench == b) & (med.policy == pol)
+                      & (med.dram_cap == cap)]["wall_ms"]
+            ys.append(float(cur.iloc[0]) / bases[b]
+                      if len(cur) else float("nan"))
         xs = [j + (i - (n - 1) / 2) * width for j in range(len(benches))]
         ax.bar(xs, ys, width=width, label=pol, color=plotting.policy_color(pol))
 
     ax.axhline(1.0, color="#666666", linewidth=1, linestyle="--")
+    ax.text(len(benches) - 0.5, 1.0, "all_dram, no pressure ",
+            va="bottom", ha="right", color="#666666", fontsize=10)
     ax.set_xticks(range(len(benches)))
     ax.set_xticklabels(benches)
-    ax.set_ylabel("slowdown vs all_dram")
-    ax.set_title("Placement policy spread (DRAM cap: %s)"
-                 % plotting.cap_label(cap))
+    ax.set_ylabel("wall time vs all-in-DRAM\n(1.0 = same, 2.0 = 2× slower)")
+    ax.set_title("Policy spread at a ~50%-of-footprint DRAM cap")
     ax.legend(title=None, ncol=len(policies))
     plotting.save(fig, out_path)
 

@@ -41,9 +41,13 @@ def main(csv_path, out_path):
     lat = df[df["metric"] == "latency"].set_index("tier")["value"]
     ax_lat.bar(present, [lat[t] for t in present], color=colors, width=0.6)
     ax_lat.set_ylabel("latency (ns/access)")
-    ax_lat.set_title("Random-access latency")
+    ax_lat.set_title("Random-access latency (lower is better)")
     for i, t in enumerate(present):
-        ax_lat.text(i, lat[t], "%.0f" % lat[t], ha="center", va="bottom")
+        ax_lat.text(i, lat[t], "%.0f ns" % lat[t], ha="center", va="bottom")
+    if "dram" in present and "far" in present:
+        ax_lat.text(0.5, 0.92, "far is %.1f× slower"
+                    % (lat["far"] / lat["dram"]),
+                    transform=ax_lat.transAxes, ha="center", color="#444444")
 
     # Bandwidth panel: read and write side by side per tier.
     x = range(len(present))
@@ -57,8 +61,12 @@ def main(csv_path, out_path):
     ax_bw.set_xticks(list(x))
     ax_bw.set_xticklabels(present)
     ax_bw.set_ylabel("bandwidth (GB/s)")
-    ax_bw.set_title("Sequential bandwidth")
+    ax_bw.set_title("Sequential bandwidth (higher is better)")
     ax_bw.legend(title=None)
+    if "dram" in present and "far" in present:
+        ax_bw.text(0.5, 0.92, "far has %.1f× less read BW"
+                   % (rbw["dram"] / rbw["far"]),
+                   transform=ax_bw.transAxes, ha="center", color="#444444")
 
     plotting.save(fig, out_path)
 

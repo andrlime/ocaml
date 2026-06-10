@@ -10,3 +10,4 @@ benchmarks/arraytraverse
 benchmarks/mixed
 build-stock/
 build-branch/
+decisionbench

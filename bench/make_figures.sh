@@ -23,9 +23,10 @@
 #
 # Knobs (environment, all optional):
 #   FAR_DEVICE   devdax device                         (default /dev/dax1.0)
-#   SIZE         working-set size per benchmark        (default 4000000)
-#   REPS         repetitions per cell                  (default 10)
-#   CAPS         DRAM caps in words for the sweep (space-separated; 0=unbounded)
+#   SIZE         working-set size per benchmark        (default 2000000)
+#   REPS         repetitions per cell                  (default 5)
+#   FRACTIONS    cap points as % of each benchmark's footprint
+#   POLICIES / BENCHES   override the sets swept
 #   FIGDIR       output directory                      (default ~/figures)
 
 set -eu
@@ -35,51 +36,74 @@ ROOT=$(cd "$HERE/.." && pwd)
 FAR_DEVICE=${FAR_DEVICE:-/dev/dax1.0}
 SIZE=${SIZE:-2000000}
 REPS=${REPS:-5}
-CAPS=${CAPS:-"0 16000000 4000000"}
 FIGDIR=${FIGDIR:-$HOME/figures}
 RESULTS="$HERE/results"
 
-# This is a real sweep: 5 policies x 3 benchmarks x caps x reps, and far-memory
-# runs are slow (millions of dependent far-latency loads each). The defaults
-# above are ~225 runs; on real devdax expect tens of minutes. Sanity-check
-# first with a tiny, fast pass:
-#   SIZE=300000 REPS=2 CAPS=0 sh make_figures.sh
-# run.sh prints [cell/total] progress to stderr so you can see it moving.
+# This is a real sweep -- 5 policies x 3 benchmarks x 7 cap points x reps -- and
+# far-memory runs are slow (millions of dependent far-latency loads each), so
+# expect tens of minutes on devdax. The sweep prints [cell/total] progress to
+# stderr. Sanity-check first with a tiny, fast pass:
+#   SIZE=300000 REPS=2 FRACTIONS="100 50" sh make_figures.sh
 
 export CAML_FAR_DEVICE="$FAR_DEVICE"
 mkdir -p "$RESULTS" "$FIGDIR"
 
 run_py() { (cd "$HERE" && uv run python "$@"); }
 
+POLICIES=${POLICIES:-"all_dram all_far flat_far size_threshold:256 attribute"}
+BENCHES=${BENCHES:-"ptrchase arraytraverse mixed"}
+# Cap points as a percentage of each benchmark's own footprint, so pressure is
+# comparable across workloads with very different sizes. 100 ~ fits in DRAM.
+FRACTIONS=${FRACTIONS:-"100 70 50 35 25 18 12"}
+DIR="$HERE/benchmarks"
+
 echo "==> building benchmarks"
-make -C "$HERE/benchmarks" >/dev/null
+make -C "$DIR" >/dev/null
 gcc -O2 -o "$HERE/membench" "$HERE/membench.c"
 cc -shared -fPIC -I "$ROOT/runtime" -I "$ROOT/runtime/caml" \
    "$HERE/noop_policy.c" -o "$HERE/noop.so"
+cc -O2 -I "$ROOT/runtime" -I "$ROOT/runtime/caml" \
+   "$DIR/decisionbench.c" -ldl -o "$HERE/decisionbench"
 
 echo "==> H1: tier characterisation (membench)"
 "$HERE/membench" "$FAR_DEVICE" 512 > "$RESULTS/membench.csv"
 
-echo "==> placement sweep -> placement.csv"
-export CAPS REPS SIZE
-sh "$HERE/run.sh" > "$RESULTS/placement.csv"
+echo "==> F3: per-decision cost (microbenchmark)"
+"$HERE/decisionbench" "$HERE/noop.so" > "$RESULTS/decision.csv"
 
-echo "==> decision-cost runs (static vs dlopen, with counting) -> decision.csv"
+echo "==> probing per-benchmark footprints (unbounded all_dram)"
+for bench in $BENCHES; do
+  fp=$(BENCH_SIZE="$SIZE" CAML_GC_POLICY=all_dram "$DIR/$bench" \
+       | awk -F, '{print $6 + $7}')
+  eval "fp_$bench=$fp"
+  echo "    $bench: $fp words" >&2
+done
+
+echo "==> placement sweep (policies x benchmarks x caps x $REPS reps)"
+ncell=$(( $(echo "$BENCHES" | wc -w) * $(echo "$POLICIES" | wc -w) \
+          * $(echo "$FRACTIONS" | wc -w) ))
+cell=0
 {
-  "$HERE/benchmarks/ptrchase" --header
-  for bench in ptrchase arraytraverse mixed; do
-    r=0
-    while [ "$r" -lt "$REPS" ]; do
-      BENCH_SIZE="$SIZE" BENCH_REP="$r" CAML_PLACEMENT_COUNT=1 \
-        CAML_GC_POLICY=all_dram "$HERE/benchmarks/$bench" \
-        | sed 's/,all_dram,/,static,/'
-      BENCH_SIZE="$SIZE" BENCH_REP="$r" CAML_PLACEMENT_COUNT=1 \
-        CAML_GC_POLICY="$HERE/noop.so" "$HERE/benchmarks/$bench" \
-        | sed "s#,$HERE/noop.so,#,dlopen,#"
-      r=$((r + 1))
+  "$DIR/$(echo "$BENCHES" | cut -d' ' -f1)" --header
+  for bench in $BENCHES; do
+    eval "fp=\$fp_$bench"
+    for policy in $POLICIES; do
+      for frac in $FRACTIONS; do
+        cap=$(( fp * frac / 100 ))
+        cell=$((cell + 1))
+        printf '[%d/%d] %s %s %d%% (cap=%d) x%s\n' \
+          "$cell" "$ncell" "$bench" "$policy" "$frac" "$cap" "$REPS" >&2
+        rep=0
+        while [ "$rep" -lt "$REPS" ]; do
+          BENCH_SIZE="$SIZE" BENCH_REP="$rep" \
+          CAML_GC_POLICY="$policy" CAML_DRAM_CAP_WORDS="$cap" \
+            "$DIR/$bench"
+          rep=$((rep + 1))
+        done
+      done
     done
   done
-} > "$RESULTS/decision.csv"
+} > "$RESULTS/placement.csv"
 
 echo "==> rendering figures into $FIGDIR"
 P="$RESULTS/placement.csv"
