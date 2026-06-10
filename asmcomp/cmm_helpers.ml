@@ -53,6 +53,15 @@ let floatarray_tag dbg = Cconst_int (Obj.double_array_tag, dbg)
 let block_header tag sz =
   Nativeint.add (Nativeint.shift_left (Nativeint.of_int sz) 10)
                 (Nativeint.of_int tag)
+
+(* Set the [reserved] value (a placement hint; see [Lambda.memory_hint] and
+   runtime/caml/placement.h) in the top reserved bits of a header. *)
+let add_reserved_bits reserved hdr =
+  if reserved = 0 || Config.reserved_header_bits = 0 then hdr
+  else
+    Nativeint.logor hdr
+      (Nativeint.shift_left (Nativeint.of_int reserved)
+         (64 - Config.reserved_header_bits))
 (* Static data corresponding to "value"s must be marked black in case we are
    in no-naked-pointers mode.  See [caml_darken] and the code below that emits
    structured constants and static module definitions. *)
@@ -827,9 +836,14 @@ let call_cached_method obj tag cache pos args dbg =
 
 (* Allocation *)
 
-let make_alloc_generic set_fn dbg tag wordsize args =
+let make_alloc_generic ?(reserved = 0) set_fn dbg tag wordsize args =
+  (* The reserved placement hint is only carried on the young-allocation path,
+     whose header is built here; large objects allocate through the runtime. *)
   if wordsize <= Config.max_young_wosize then
-    Cop(Calloc, Cconst_natint(block_header tag wordsize, dbg) :: args, dbg)
+    Cop(Calloc,
+        Cconst_natint(add_reserved_bits reserved (block_header tag wordsize),
+                      dbg) :: args,
+        dbg)
   else begin
     let id = V.create_local "*alloc*" in
     let rec fill_fields idx = function
@@ -842,12 +856,12 @@ let make_alloc_generic set_fn dbg tag wordsize args =
          fill_fields 1 args)
   end
 
-let make_alloc dbg tag args =
+let make_alloc ?(reserved = 0) dbg tag args =
   let addr_array_init arr ofs newval dbg =
     Cop(Cextcall("caml_initialize", typ_void, [], false),
         [array_indexing log2_size_addr arr ofs dbg; newval], dbg)
   in
-  make_alloc_generic addr_array_init dbg tag (List.length args) args
+  make_alloc_generic ~reserved addr_array_init dbg tag (List.length args) args
 
 let make_float_alloc dbg tag args =
   make_alloc_generic float_array_set dbg tag

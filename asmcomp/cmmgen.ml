@@ -31,6 +31,13 @@ module V = Backend_var
 module VP = Backend_var.With_provenance
 open Cmm_helpers
 
+(* Encode a placement hint into the value the runtime reads from a block's
+   reserved header bits. Must match CAML_HINT_* in runtime/caml/placement.h. *)
+let reserved_of_memory_hint : Lambda.memory_hint -> int = function
+  | Default_memory -> 0   (* CAML_HINT_NONE *)
+  | Main_memory -> 1      (* CAML_HINT_MAIN *)
+  | Far_memory -> 2       (* CAML_HINT_FAR *)
+
 (* Environments used for translation to Cmm. *)
 
 type boxed_number =
@@ -477,8 +484,9 @@ let rec transl env e =
           Cconst_symbol (sym, dbg)
       | (Pmakeblock _, []) ->
           assert false
-      | (Pmakeblock(tag, _mut, _kind), args) ->
-          make_alloc dbg tag (List.map (transl env) args)
+      | (Pmakeblock(tag, _mut, _kind, hint), args) ->
+          make_alloc ~reserved:(reserved_of_memory_hint hint) dbg tag
+            (List.map (transl env) args)
       | (Pccall prim, args) ->
           transl_ccall env prim args dbg
       | (Pduparray (kind, _), [Uprim (Pmakearray (kind', _), args, _dbg)]) ->
@@ -906,7 +914,7 @@ and transl_prim_1 env p arg dbg =
     | Paddfloat | Psubfloat | Pmulfloat | Pdivfloat
     | Pstringrefu | Pstringrefs | Pbytesrefu | Pbytessetu
     | Pbytesrefs | Pbytessets | Pisout | Pread_symbol _
-    | Pmakeblock (_, _, _) | Psetfield (_, _, _) | Psetfield_computed (_, _)
+    | Pmakeblock (_, _, _, _) | Psetfield (_, _, _) | Psetfield_computed (_, _)
     | Psetfloatfield (_, _) | Pduprecord (_, _) | Pccall _ | Pdivint _
     | Pmodint _ | Pintcomp _ | Pfloatcomp _ | Pmakearray (_, _)
     | Pcompare_ints | Pcompare_floats | Pcompare_bints _
@@ -1105,7 +1113,8 @@ and transl_prim_2 env p arg1 arg2 dbg =
   | Pnot | Pnegint | Pintoffloat | Pfloatofint | Pnegfloat
   | Pabsfloat | Pstringlength | Pbyteslength | Pbytessetu | Pbytessets
   | Pisint | Pbswap16 | Pint_as_pointer | Popaque | Pread_symbol _
-  | Pmakeblock (_, _, _) | Pfield _ | Psetfield_computed (_, _) | Pfloatfield _
+  | Pmakeblock (_, _, _, _) | Pfield _ | Psetfield_computed (_, _)
+  | Pfloatfield _
   | Pduprecord (_, _) | Pccall _ | Praise _ | Poffsetint _ | Poffsetref _
   | Pmakearray (_, _) | Pduparray (_, _) | Parraylength _ | Parraysetu _
   | Parraysets _ | Pbintofint _ | Pintofbint _ | Pcvtbint (_, _)
@@ -1175,7 +1184,8 @@ and transl_prim_3 env p arg1 arg2 arg3 dbg =
   | Pintoffloat | Pfloatofint | Pnegfloat | Pabsfloat | Paddfloat | Psubfloat
   | Pmulfloat | Pdivfloat | Pstringlength | Pstringrefu | Pstringrefs
   | Pbyteslength | Pbytesrefu | Pbytesrefs | Pisint | Pisout
-  | Pbswap16 | Pint_as_pointer | Popaque | Pread_symbol _ | Pmakeblock (_, _, _)
+  | Pbswap16 | Pint_as_pointer | Popaque | Pread_symbol _
+  | Pmakeblock (_, _, _, _)
   | Pfield _ | Psetfield (_, _, _) | Pfloatfield _ | Psetfloatfield (_, _)
   | Pduprecord (_, _) | Pccall _ | Praise _ | Pdivint _ | Pmodint _ | Pintcomp _
   | Pcompare_ints | Pcompare_floats | Pcompare_bints _

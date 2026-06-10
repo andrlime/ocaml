@@ -42,3 +42,10 @@ CAMLprim value hint_roundtrip(value hint)
   header_t hd = Make_header_with_reserved(3, 0, 0, Int_val(hint));
   return Val_int(Reserved_hd(hd));
 }
+
+/* The reserved bits of a live block's header, where the compiler stores the
+   [@far_memory] / [@main_memory] placement hint. */
+CAMLprim value block_reserved(value v)
+{
+  return Val_int(Reserved_hd(Hd_val(v)));
+}

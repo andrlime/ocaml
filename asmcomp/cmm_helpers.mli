@@ -309,8 +309,11 @@ val call_cached_method :
 
 (** Allocations *)
 
-(** Allocate a block of regular values with the given tag *)
-val make_alloc : Debuginfo.t -> int -> expression list -> expression
+(** Allocate a block of regular values with the given tag. [reserved] sets the
+    block header's reserved bits (a placement hint); it only takes effect on the
+    young-allocation path. *)
+val make_alloc :
+  ?reserved:int -> Debuginfo.t -> int -> expression list -> expression
 
 (** Allocate a block of unboxed floats with the given tag *)
 val make_float_alloc : Debuginfo.t -> int -> expression list -> expression
