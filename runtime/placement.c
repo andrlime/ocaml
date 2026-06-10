@@ -16,20 +16,26 @@
 
 #include <string.h>
 #include "caml/misc.h"
+#include "caml/mlvalues.h"
 #include "caml/osdeps.h"
+#include "caml/shared_heap.h"
 #include "caml/placement_internal.h"
 
 /* Installed once by caml_placement_init before any domain spawns, then only
    read, so a plain pointer needs no synchronisation. */
 static const caml_placement_policy_ops *active_policy = NULL;
 
+/* The default tier: where objects live when a policy expresses no preference,
+   and the backstop a buggy policy is clamped to. Tier 0 is local DRAM. */
+#define CAML_ARENA_DEFAULT CAML_ARENA_DRAM
+
 /* Map a policy's raw return into a safe arena selector: CAML_ARENA_STAY is
-   honoured, anything else out of range falls back to local DRAM so that a
-   buggy policy can never route an object to a nonexistent arena. */
+   honoured, anything else out of range falls back to the default tier so that
+   a buggy policy can never route an object to a nonexistent arena. */
 static int clamp_arena(int arena)
 {
   if (arena == CAML_ARENA_STAY) return arena;
-  if (arena < 0 || arena >= CAML_ARENA_COUNT) return CAML_ARENA_DRAM;
+  if (arena < 0 || arena >= CAML_ARENA_COUNT) return CAML_ARENA_DEFAULT;
   return arena;
 }
 
@@ -52,8 +58,28 @@ static const caml_placement_policy_ops all_dram_policy = {
   .shutdown        = NULL,
 };
 
+/* Place pointer-bearing objects (low memory-level parallelism, latency
+   sensitive) in DRAM and flat objects (strings, doubles, custom blocks) in far
+   memory. The scannable bit is a free Tier-0 proxy for this distinction. */
+static int flat_far_choose_arena(const caml_placement_features *features)
+{
+  return features->scannable ? CAML_ARENA_DRAM : CAML_ARENA_FAR;
+}
+
+static const caml_placement_policy_ops flat_far_policy = {
+  .abi_version     = CAML_PLACEMENT_ABI_VERSION,
+  .name            = "flat_far",
+  .features_needed = CAML_FEAT_NONE,
+  .init            = NULL,
+  .choose_arena    = flat_far_choose_arena,
+  .after_minor     = NULL,
+  .should_migrate  = NULL,
+  .shutdown        = NULL,
+};
+
 static const caml_placement_policy_ops * const builtin_policies[] = {
   &all_dram_policy,
+  &flat_far_policy,
   NULL
 };
 
@@ -113,7 +139,24 @@ void caml_placement_shutdown(void)
   active_policy = NULL;
 }
 
+void caml_placement_fill(caml_placement_features *features, header_t hd,
+                         caml_domain_state *d, uint8_t site)
+{
+  memset(features, 0, sizeof *features);
+  features->wosize = Wosize_hd(hd);
+  features->tag = Tag_hd(hd);
+  features->scannable = Scannable_tag(features->tag);
+  features->hint = Reserved_hd(hd);
+  features->site = site;
+  features->color = (uint8_t)(Color_hd(hd) >> HEADER_COLOR_SHIFT);
+  features->domain = d->id;
+  features->minor_used = (uintnat)(d->young_end - d->young_ptr);
+  features->minor_size = d->minor_heap_wsz;
+  caml_shared_arena_used(features->arena_used);
+}
+
 int caml_placement_choose(const caml_placement_features *features)
 {
-  return clamp_arena(active_policy->choose_arena(features));
+  int arena = clamp_arena(active_policy->choose_arena(features));
+  return arena == CAML_ARENA_STAY ? CAML_ARENA_DEFAULT : arena;
 }

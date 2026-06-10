@@ -35,6 +35,7 @@
 #include "caml/minor_gc.h"
 #include "caml/misc.h"
 #include "caml/mlvalues.h"
+#include "caml/placement_internal.h"
 #include "caml/platform.h"
 #include "caml/roots.h"
 #include "caml/shared_heap.h"
@@ -152,8 +153,14 @@ struct oldify_state {
 static value alloc_shared(caml_domain_state* d,
                           mlsize_t wosize, tag_t tag, reserved_t reserved)
 {
-  void* mem = caml_shared_try_alloc(d->shared_heap, wosize, tag,
-                                    reserved);
+  header_t hd = Make_header_with_reserved(wosize, tag,
+                                          caml_allocation_status(), reserved);
+  caml_placement_features features;
+  caml_placement_fill(&features, hd, d, CAML_PLACE_PROMOTION);
+  int arena = caml_placement_choose(&features);
+
+  void* mem = caml_shared_try_alloc_arena(d->shared_heap, wosize, tag,
+                                          reserved, arena);
   caml_update_major_allocated_words(
     d, Whsize_wosize(wosize), 0 /* promoted, not direct */);
   if (mem == NULL) {

@@ -21,6 +21,7 @@
 #ifdef CAML_INTERNALS
 
 #include "placement.h"
+#include "domain_state.h"
 
 /* Resolve CAML_GC_POLICY and install the active policy. Called once from
    caml_init_gc, before any domain spawns. */
@@ -29,8 +30,18 @@ void caml_placement_init(void);
 /* Run the active policy's shutdown callback, if any, and forget it. */
 void caml_placement_shutdown(void);
 
-/* Where the active policy would place an object, clamped to a valid arena
-   selector. Pure in [features]; safe to call concurrently across domains. */
+/* The single site where the engine populates [features] for one object about
+   to enter the major heap: [hd] is the object's header, [d] the allocating or
+   promoting domain, and [site] a CAML_PLACE_* selector. Fills the Tier-0
+   facts; higher tiers are left zero until their subsystems exist. Non-
+   allocating, so it is safe to call mid-collection. */
+void caml_placement_fill(caml_placement_features *features, header_t hd,
+                         caml_domain_state *d, uint8_t site);
+
+/* The arena the active policy chooses for [features], resolved to a concrete
+   tier ready to allocate into: an out-of-range answer or CAML_ARENA_STAY (a
+   migration concept, meaningless at allocation time) becomes the default tier.
+   Pure in [features]; safe to call concurrently across domains. */
 int caml_placement_choose(const caml_placement_features *features);
 
 #endif /* CAML_INTERNALS */
