@@ -14,6 +14,7 @@
 
 #define CAML_INTERNALS
 
+#include <stdlib.h>
 #include <string.h>
 #include "caml/gc.h"
 #include "caml/misc.h"
@@ -78,9 +79,63 @@ static const caml_placement_policy_ops flat_far_policy = {
   .shutdown        = NULL,
 };
 
+/* Place every object in far memory. Mainly an evaluation control: the
+   far-memory upper bound against which steering policies are measured. */
+static int all_far_choose_arena(const caml_placement_features *features)
+{
+  (void) features;
+  return CAML_ARENA_FAR;
+}
+
+static const caml_placement_policy_ops all_far_policy = {
+  .abi_version     = CAML_PLACEMENT_ABI_VERSION,
+  .name            = "all_far",
+  .features_needed = CAML_FEAT_NONE,
+  .init            = NULL,
+  .choose_arena    = all_far_choose_arena,
+  .after_minor     = NULL,
+  .should_migrate  = NULL,
+  .shutdown        = NULL,
+};
+
+/* Place objects of at least [size_threshold_words] words in far memory and
+   smaller ones in DRAM, sending bulk data to the slow tier. The threshold is
+   read once at init from CAML_GC_POLICY="size_threshold:<words>" and only read
+   afterwards, so it is immutable during the concurrent choose_arena calls. */
+#define SIZE_THRESHOLD_DEFAULT_WORDS 256
+static uintnat size_threshold_words = SIZE_THRESHOLD_DEFAULT_WORDS;
+
+static int size_threshold_init(const char *config)
+{
+  if (config != NULL && config[0] != '\0') {
+    uintnat words = (uintnat) strtoull(config, NULL, 0);
+    if (words > 0) size_threshold_words = words;
+  }
+  return 0;
+}
+
+static int size_threshold_choose_arena(const caml_placement_features *features)
+{
+  return features->wosize >= size_threshold_words
+       ? CAML_ARENA_FAR : CAML_ARENA_DRAM;
+}
+
+static const caml_placement_policy_ops size_threshold_policy = {
+  .abi_version     = CAML_PLACEMENT_ABI_VERSION,
+  .name            = "size_threshold",
+  .features_needed = CAML_FEAT_NONE,
+  .init            = size_threshold_init,
+  .choose_arena    = size_threshold_choose_arena,
+  .after_minor     = NULL,
+  .should_migrate  = NULL,
+  .shutdown        = NULL,
+};
+
 static const caml_placement_policy_ops * const builtin_policies[] = {
   &all_dram_policy,
+  &all_far_policy,
   &flat_far_policy,
+  &size_threshold_policy,
   NULL
 };
 
@@ -114,7 +169,16 @@ void caml_placement_init(void)
   char_os *spec_os = caml_secure_getenv(T("CAML_GC_POLICY"));
 
   if (spec_os != NULL) {
+    /* CAML_GC_POLICY is "name" or "name:config"; the config string, if any, is
+       handed to the policy's init. */
+    const char *config = NULL;
     char *spec = caml_stat_strdup_of_os(spec_os);
+    char *colon = strchr(spec, ':');
+    if (colon != NULL) {
+      *colon = '\0';
+      config = colon + 1;
+    }
+
     if (looks_like_dynamic(spec)) {
       caml_gc_log("placement: dynamic policy '%s' ignored "
                   "(dlopen support not yet built); using '%s'",
@@ -126,6 +190,12 @@ void caml_placement_init(void)
       else
         caml_gc_log("placement: unknown policy '%s'; using '%s'",
                     spec, ops->name);
+    }
+
+    if (ops->init != NULL && ops->init(config) != 0) {
+      caml_gc_log("placement: policy '%s' init failed; using '%s'",
+                  ops->name, all_dram_policy.name);
+      ops = &all_dram_policy;
     }
     caml_stat_free(spec);
   }
