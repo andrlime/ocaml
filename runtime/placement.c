@@ -151,11 +151,66 @@ static const caml_placement_policy_ops size_threshold_policy = {
   .shutdown        = NULL,
 };
 
+/* Honour the compiler placement hint carried in an object's reserved header
+   bits ([@far_memory] -> far, [@main_memory] -> DRAM). Unannotated objects
+   defer to a fallback sub-policy, named with its own optional config in
+   CAML_GC_POLICY="attribute:<subpolicy>[:<config>]" and defaulting to
+   all_dram. */
+static const caml_placement_policy_ops *find_builtin(const char *name);
+
+static int (*attribute_fallback)(const caml_placement_features *) =
+  all_dram_choose_arena;
+
+static int attribute_init(const char *config)
+{
+  if (config == NULL || config[0] == '\0') return 0;
+
+  /* [config] is a sub-policy spec "<name>[:<sub-config>]"; split off the
+     sub-policy's own config and hand it to that policy's init. */
+  char *spec = caml_stat_strdup(config);
+  char *colon = strchr(spec, ':');
+  const char *sub_config = NULL;
+  if (colon != NULL) { *colon = '\0'; sub_config = colon + 1; }
+
+  int rc = 0;
+  const caml_placement_policy_ops *sub = find_builtin(spec);
+  if (sub == NULL || strcmp(spec, "attribute") == 0) {
+    caml_gc_log("placement: attribute: unknown fallback '%s'; using all_dram",
+                spec);
+  } else {
+    if (sub->init != NULL) rc = sub->init(sub_config);
+    attribute_fallback = sub->choose_arena;
+  }
+  caml_stat_free(spec);
+  return rc;
+}
+
+static int attribute_choose_arena(const caml_placement_features *features)
+{
+  switch (features->hint) {
+    case CAML_HINT_FAR:  return CAML_ARENA_FAR;
+    case CAML_HINT_MAIN: return CAML_ARENA_DRAM;
+    default:             return attribute_fallback(features);
+  }
+}
+
+static const caml_placement_policy_ops attribute_policy = {
+  .abi_version     = CAML_PLACEMENT_ABI_VERSION,
+  .name            = "attribute",
+  .features_needed = CAML_FEAT_NONE,
+  .init            = attribute_init,
+  .choose_arena    = attribute_choose_arena,
+  .after_minor     = NULL,
+  .should_migrate  = NULL,
+  .shutdown        = NULL,
+};
+
 static const caml_placement_policy_ops * const builtin_policies[] = {
   &all_dram_policy,
   &all_far_policy,
   &flat_far_policy,
   &size_threshold_policy,
+  &attribute_policy,
   NULL
 };
 
