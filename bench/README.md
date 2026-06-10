@@ -30,6 +30,18 @@ see the header of `make_figures.sh`. Pin the run for stable numbers:
 numactl --cpunodebind=0 --membind=0 sh make_figures.sh
 ```
 
+## F5 alone -- the fast path (~10 min)
+
+The full sweep is dominated by F5 (a cap sweep over every policy x benchmark).
+To regenerate just F5 quickly, `make_f5.sh` runs only the headline workload and
+the three policies that show the three distinct behaviours (naive-local,
+naive-far, criticality-aware), at a smaller size:
+
+```sh
+sh make_f5.sh                       # -> ~/figures/fig_f5_pressure.png
+BENCH=ptrchase sh make_f5.sh        # a different headline workload
+```
+
 ## F2 (overhead vs stock) -- separate, slower
 
 F2 needs a second, stock OCaml compiler to compare against, so it lives in its
