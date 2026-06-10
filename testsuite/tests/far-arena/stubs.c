@@ -1,6 +1,7 @@
 #define CAML_INTERNALS
 
 #include <caml/mlvalues.h>
+#include <caml/gc.h>
 #include <caml/domain_state.h>
 #include <caml/shared_heap.h>
 #include <caml/placement.h>
@@ -31,4 +32,13 @@ CAMLprim value far_arena_used(value arena)
   uintnat used[CAML_ARENA_COUNT];
   caml_shared_arena_used(used);
   return Val_long(used[Long_val(arena)]);
+}
+
+/* Round-trip a placement hint through the reserved header bits, reading it back
+   the way the engine does (Reserved_hd). Confirms a hint survives in a header
+   at runtime; pure encoding, so it needs no far device. */
+CAMLprim value hint_roundtrip(value hint)
+{
+  header_t hd = Make_header_with_reserved(3, 0, 0, Int_val(hint));
+  return Val_int(Reserved_hd(hd));
 }

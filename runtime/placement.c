@@ -14,6 +14,7 @@
 
 #define CAML_INTERNALS
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include "caml/camlatomic.h"
@@ -24,6 +25,14 @@
 #include "caml/osdeps.h"
 #include "caml/shared_heap.h"
 #include "caml/placement_internal.h"
+
+/* A compiler placement hint (CAML_HINT_*) travels in an object's reserved
+   header bits and is read back via Reserved_hd in caml_placement_fill. Pin that
+   the build's reserved field is wide enough to hold every hint value; the tree
+   is configured with --enable-reserved-header-bits=2. */
+static_assert(((header_t)1 << HEADER_RESERVED_BITS) > CAML_HINT_FAR,
+              "placement hints need at least 2 reserved header bits "
+              "(configure with --enable-reserved-header-bits=2)");
 
 /* Installed once by caml_placement_init before any domain spawns, then only
    read, so a plain pointer needs no synchronisation. */
