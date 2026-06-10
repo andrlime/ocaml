@@ -125,6 +125,11 @@ let block_shape ppf shape = match shape with
         t;
       Format.fprintf ppf ")"
 
+let memory_hint ppf = function
+  | Default_memory -> ()
+  | Main_memory -> Format.fprintf ppf "[@main_memory]"
+  | Far_memory -> Format.fprintf ppf "[@far_memory]"
+
 let integer_comparison ppf = function
   | Ceq -> fprintf ppf "=="
   | Cne -> fprintf ppf "!="
@@ -155,10 +160,10 @@ let primitive ppf = function
   | Pignore -> fprintf ppf "ignore"
   | Pgetglobal id -> fprintf ppf "global %a" Ident.print id
   | Psetglobal id -> fprintf ppf "setglobal %a" Ident.print id
-  | Pmakeblock(tag, Immutable, shape) ->
-      fprintf ppf "makeblock %i%a" tag block_shape shape
-  | Pmakeblock(tag, Mutable, shape) ->
-      fprintf ppf "makemutable %i%a" tag block_shape shape
+  | Pmakeblock(tag, Immutable, shape, hint) ->
+      fprintf ppf "makeblock %i%a%a" tag block_shape shape memory_hint hint
+  | Pmakeblock(tag, Mutable, shape, hint) ->
+      fprintf ppf "makemutable %i%a%a" tag block_shape shape memory_hint hint
   | Pmakelazyblock Lazy_tag ->
       fprintf ppf "makelazyblock"
   | Pmakelazyblock Forward_tag ->

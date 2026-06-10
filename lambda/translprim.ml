@@ -153,8 +153,10 @@ let primitives_table =
     "%field1", Primitive (Pfield(1, Pointer, Mutable), 1);
     "%setfield0", Primitive ((Psetfield(0, Pointer, Assignment)), 2);
     "%setfield1", Primitive ((Psetfield(1, Pointer, Assignment)), 2);
-    "%makeblock", Primitive ((Pmakeblock(0, Immutable, None)), 1);
-    "%makemutable", Primitive ((Pmakeblock(0, Mutable, None)), 1);
+    "%makeblock",
+      Primitive ((Pmakeblock(0, Immutable, None, Default_memory)), 1);
+    "%makemutable",
+      Primitive ((Pmakeblock(0, Mutable, None, Default_memory)), 1);
     "%raise", Raise Raise_regular;
     "%reraise", Raise Raise_reraise;
     "%raise_notrace", Raise Raise_notrace;
@@ -518,10 +520,11 @@ let specialize_primitive env ty ~has_constant_constructor prim =
       | Pbigarray_unknown, Pbigarray_unknown_layout -> None
       | _, _ -> Some (Primitive (Pbigarrayset(unsafe, n, k, l), arity))
     end
-  | Primitive (Pmakeblock(tag, mut, None), arity), fields -> begin
+  | Primitive (Pmakeblock(tag, mut, None, hint), arity), fields -> begin
       let shape = List.map (Typeopt.value_kind env) fields in
       let useful = List.exists (fun knd -> knd <> Pgenval) shape in
-      if useful then Some (Primitive (Pmakeblock(tag, mut, Some shape), arity))
+      if useful
+      then Some (Primitive (Pmakeblock(tag, mut, Some shape, hint), arity))
       else None
     end
   | Comparison(comp, Compare_generic), p1 :: _ ->
@@ -793,7 +796,7 @@ let raise_todo ~loc arg arg_exps =
   Lsequence (arg,
     Lprim (
       Praise Raise_regular,
-      [Lprim (Pmakeblock (0, Immutable, None),
+      [Lprim (Pmakeblock (0, Immutable, None, Default_memory),
               [todo_exn_id;
                Lconst (Const_block (0,
                  [Const_immstring fname;
@@ -846,7 +849,7 @@ let lambda_of_prim prim_name prim loc args arg_exps =
       lambda_of_loc kind loc
   | Loc kind, [arg] ->
       let lam = lambda_of_loc kind loc in
-      Lprim(Pmakeblock(0, Immutable, None), [lam; arg], loc)
+      Lprim(Pmakeblock(0, Immutable, None, Default_memory), [lam; arg], loc)
   | Send, [obj; meth] ->
       Lsend(Public, meth, obj, [], loc)
   | Send_self, [obj; meth] ->

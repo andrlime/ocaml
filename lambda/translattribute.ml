@@ -383,11 +383,20 @@ let add_function_attributes lam loc attr =
   lam
 
 (* The [@far_memory] / [@main_memory] placement hints steer where an allocation
-   is placed (see the [attribute] GC policy). Mark them used so a hint on an
-   allocation does not trip warning 53; a hint anywhere else stays unmarked and
-   is reported as misplaced. The hint is read back and threaded into the
-   allocation by a later pass. *)
+   is placed (see the [attribute] GC policy). Marking them used keeps a hint on
+   an allocation from tripping warning 53; a hint anywhere else stays unmarked
+   and is reported as misplaced. *)
+
+(* Read the placement hint off an allocation. Both attributes are always
+   inspected so both are marked used; if both appear, [@far_memory] wins. *)
+let get_memory_hint_attribute attrs =
+  let far = has_attribute "far_memory" attrs in
+  let main = has_attribute "main_memory" attrs in
+  if far then Far_memory
+  else if main then Main_memory
+  else Default_memory
+
+(* Mark the hints used without reading them, for allocations that do not yet
+   carry a hint (e.g. arrays, which lower through Pmakearray). *)
 let check_memory_hint_attributes attrs =
-  let _ : bool = has_attribute "far_memory" attrs in
-  let _ : bool = has_attribute "main_memory" attrs in
-  ()
+  ignore (get_memory_hint_attribute attrs : memory_hint)

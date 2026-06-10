@@ -1,0 +1,7 @@
+(setglobal Memory_hint!
+  (let
+    (record = (function x[int] (makeblock 0 (int,int)[@far_memory] x x))
+     tuple = (function x (makeblock 0[@main_memory] x x))
+     constructor = (function x (makeblock 0[@far_memory] x))
+     plain = (function x (makeblock 0 x x)))
+    (makeblock 0 record tuple constructor plain)))

@@ -65,8 +65,14 @@ val add_function_attributes
   -> Parsetree.attributes
   -> Lambda.lambda
 
-(* Recognise the [@far_memory] / [@main_memory] placement hints on an
-   allocation, marking them used for the purpose of warning 53. *)
+(* Read the [@far_memory] / [@main_memory] placement hint off an allocation,
+   marking the attributes used for the purpose of warning 53. *)
+val get_memory_hint_attribute
+   : Parsetree.attributes
+  -> Lambda.memory_hint
+
+(* Mark the placement hints used without reading them, for allocations that do
+   not yet carry a hint. *)
 val check_memory_hint_attributes
    : Parsetree.attributes
   -> unit

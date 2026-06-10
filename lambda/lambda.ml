@@ -56,7 +56,7 @@ type primitive =
   | Pgetglobal of Ident.t
   | Psetglobal of Ident.t
   (* Operations on heap blocks *)
-  | Pmakeblock of int * mutable_flag * block_shape
+  | Pmakeblock of int * mutable_flag * block_shape * memory_hint
   | Pmakelazyblock of lazy_block_tag
   | Pfield of int * immediate_or_pointer * mutable_flag
   | Pfield_computed
@@ -177,6 +177,14 @@ and value_kind =
 
 and block_shape =
   value_kind list option
+
+(* Where the GC should place a freshly allocated block, from the
+   [@main_memory] / [@far_memory] attributes. [Default_memory] leaves the
+   choice to the placement policy. *)
+and memory_hint =
+  | Default_memory
+  | Main_memory
+  | Far_memory
 
 and array_kind =
     Pgenarray | Paddrarray | Pintarray | Pfloatarray
@@ -768,7 +776,7 @@ let rec make_sequence fn = function
 
 let make_atomic_loc ~loc arg field =
   let shape = Some [Pgenval; Pintval] in
-  Lprim (Pmakeblock (0, Immutable, shape), [arg; field], loc)
+  Lprim (Pmakeblock (0, Immutable, shape, Default_memory), [arg; field], loc)
 
 (* Apply a substitution to a lambda-term.
    Assumes that the image of the substitution is out of reach
