@@ -7,12 +7,27 @@ The story the figures tell, in order:
 |---|---|---|
 | H1 | `plot_hardware.py` | the DRAM and far tiers genuinely differ (latency + bandwidth) |
 | F1 | `plot_expressiveness.py` | many policies, tiny, three authoring surfaces |
-| F2 | `plot_overhead.py` | the framework is free vs stock OCaml (`all_dram`) |
 | F3 | `plot_decision_cost.py` | a placement decision costs a few ns (static vs dlopen) |
 | A1 | `plot_envelope.py` | `all_dram` (upper bound) vs `all_far` (naive control) |
 | F4 | `plot_spread.py` | criticality-aware policies fill the envelope |
 | F5 | `plot_pressure.py` | the win grows as DRAM gets scarcer |
 | F6 | `plot_occupancy.py` | the steering is real: arena occupancy splits by policy |
+
+## One command
+
+On the box with the far-memory device:
+
+```sh
+sh make_figures.sh          # builds, collects data, renders every figure
+```
+
+It writes the figures to `~/figures/fig_*.png` and the raw CSVs to `results/`.
+Tune it with environment knobs (`FAR_DEVICE`, `SIZE`, `REPS`, `CAPS`, `FIGDIR`);
+see the header of `make_figures.sh`. Pin the run for stable numbers:
+
+```sh
+numactl --cpunodebind=0 --membind=0 sh make_figures.sh
+```
 
 ## Layout
 

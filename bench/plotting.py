@@ -21,7 +21,53 @@ red naive control, the steering policies sit between.
 """
 
 import matplotlib.pyplot as plt
+import pandas as pd
 import seaborn as sns
+
+# Order policies appear in, left to right, when all are shown.
+POLICY_ORDER = [
+    "all_dram", "size_threshold", "flat_far", "attribute", "all_far"]
+
+
+def policy_label(name):
+    """Strip any ':config' suffix so size_threshold:256 reads as the policy."""
+    return name.split(":")[0]
+
+
+def load_placement(csv_path):
+    """Load a placement sweep CSV and normalise the policy column (dropping
+    ':config' suffixes) so rows group by policy."""
+    df = pd.read_csv(csv_path)
+    df["policy"] = df["policy"].map(policy_label)
+    return df
+
+
+def median_by(df, keys, value="wall_ms"):
+    """Median of [value] over reps, grouped by [keys]."""
+    return df.groupby(keys, as_index=False)[value].median()
+
+
+def ordered_policies(present):
+    """[present] policies in the canonical order, unknowns appended."""
+    known = [p for p in POLICY_ORDER if p in present]
+    return known + [p for p in present if p not in known]
+
+
+def most_pressure_cap(df):
+    """The DRAM cap with the most memory pressure: the smallest non-zero cap
+    (cap 0 means unbounded). Returns 0 if only the unbounded cap exists."""
+    caps = [c for c in df["dram_cap"].unique() if c != 0]
+    return min(caps) if caps else 0
+
+
+def cap_label(cap):
+    return "unbounded" if cap == 0 else "%d words" % cap
+
+
+def default_bench(df):
+    """Prefer the mixed workload (the headline) if present, else the first."""
+    benches = set(df["bench"].unique())
+    return "mixed" if "mixed" in benches else sorted(benches)[0]
 
 # seaborn "colorblind" palette, assigned semantically and kept stable so a
 # policy/tier is the same colour in every figure.
