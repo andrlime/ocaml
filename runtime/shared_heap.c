@@ -612,13 +612,6 @@ value* caml_shared_try_alloc_arena(struct caml_heap_state* local,
   return p;
 }
 
-value* caml_shared_try_alloc(struct caml_heap_state* local, mlsize_t wosize,
-                             tag_t tag, reserved_t reserved)
-{
-  return caml_shared_try_alloc_arena(local, wosize, tag, reserved,
-                                     CAML_ARENA_DRAM);
-}
-
 /* Sweeping of the major heap shared pools */
 static intnat pool_sweep(struct caml_heap_state* local, pool** plist,
                          sizeclass sz, int release_to_global_pool) {

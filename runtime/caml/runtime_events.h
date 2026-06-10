@@ -331,7 +331,7 @@ void caml_ev_counter(ev_runtime_counter counter, uint64_t val);
 CAMLextern void caml_ev_lifecycle(ev_lifecycle lifecycle, int64_t data);
 
 /* caml_ev_alloc records the (bucketed) size of allocations into the major heap.
-   It appears only in alloc_shr and caml_shared_try_alloc. These buckets are
+   It appears only in caml_shared_try_alloc_arena. These buckets are
    meant to be flushed explicitly by the caller through the caml_ev_alloc_flush
    function. Until then the buckets are just updated until flushed.
 */

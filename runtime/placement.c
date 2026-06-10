@@ -15,6 +15,7 @@
 #define CAML_INTERNALS
 
 #include <string.h>
+#include "caml/gc.h"
 #include "caml/misc.h"
 #include "caml/mlvalues.h"
 #include "caml/osdeps.h"
@@ -159,4 +160,16 @@ int caml_placement_choose(const caml_placement_features *features)
 {
   int arena = clamp_arena(active_policy->choose_arena(features));
   return arena == CAML_ARENA_STAY ? CAML_ARENA_DEFAULT : arena;
+}
+
+value *caml_placement_alloc(struct caml_heap_state *heap, caml_domain_state *d,
+                            mlsize_t wosize, tag_t tag, reserved_t reserved,
+                            uint8_t site)
+{
+  header_t hd = Make_header_with_reserved(wosize, tag,
+                                          caml_allocation_status(), reserved);
+  caml_placement_features features;
+  caml_placement_fill(&features, hd, d, site);
+  int arena = caml_placement_choose(&features);
+  return caml_shared_try_alloc_arena(heap, wosize, tag, reserved, arena);
 }

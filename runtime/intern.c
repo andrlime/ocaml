@@ -34,6 +34,7 @@
 #include "caml/memprof.h"
 #include "caml/mlvalues.h"
 #include "caml/misc.h"
+#include "caml/placement_internal.h"
 #include "caml/reverse.h"
 #include "caml/shared_heap.h"
 #include "caml/signals.h"
@@ -500,8 +501,8 @@ static value intern_alloc_obj(struct caml_intern_state* s, caml_domain_state* d,
                               CAML_MEMPROF_SRC_MARSHAL);
     s->intern_dest += 1 + wosize;
   } else {
-    p = caml_shared_try_alloc(d->shared_heap, wosize, tag,
-                              0 /* no reserved bits */);
+    p = caml_placement_alloc(d->shared_heap, d, wosize, tag,
+                             0 /* no reserved bits */, CAML_PLACE_DIRECT);
     if (p == NULL) {
       intern_cleanup (s);
       caml_raise_out_of_memory();

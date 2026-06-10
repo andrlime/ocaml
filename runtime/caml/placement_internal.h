@@ -23,6 +23,8 @@
 #include "placement.h"
 #include "domain_state.h"
 
+struct caml_heap_state;
+
 /* Resolve CAML_GC_POLICY and install the active policy. Called once from
    caml_init_gc, before any domain spawns. */
 void caml_placement_init(void);
@@ -43,6 +45,15 @@ void caml_placement_fill(caml_placement_features *features, header_t hd,
    migration concept, meaningless at allocation time) becomes the default tier.
    Pure in [features]; safe to call concurrently across domains. */
 int caml_placement_choose(const caml_placement_features *features);
+
+/* Allocate a [wosize]/[tag]/[reserved] block into [heap], placed in the tier
+   the active policy chooses for an object entering at [site]. This is the one
+   path objects take into the major heap, from both promotion and direct major
+   allocation. Returns the block's header pointer, or NULL on allocation
+   failure. */
+value *caml_placement_alloc(struct caml_heap_state *heap, caml_domain_state *d,
+                            mlsize_t wosize, tag_t tag, reserved_t reserved,
+                            uint8_t site);
 
 #endif /* CAML_INTERNALS */
 

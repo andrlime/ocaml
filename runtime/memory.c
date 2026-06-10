@@ -31,6 +31,7 @@
 #include "caml/memory.h"
 #include "caml/memprof.h"
 #include "caml/major_gc.h"
+#include "caml/placement_internal.h"
 #include "caml/signals.h"
 #include "caml/shared_heap.h"
 #include "caml/domain.h"
@@ -421,8 +422,8 @@ Caml_inline value alloc_shr(mlsize_t wosize, tag_t tag, reserved_t reserved,
 {
   Caml_check_caml_state();
   caml_domain_state *dom_st = Caml_state;
-  value *v = caml_shared_try_alloc(dom_st->shared_heap,
-                                   wosize, tag, reserved);
+  value *v = caml_placement_alloc(dom_st->shared_heap, dom_st,
+                                  wosize, tag, reserved, CAML_PLACE_DIRECT);
   if (v == NULL) {
     if (!noexc)
       caml_raise_out_of_memory();

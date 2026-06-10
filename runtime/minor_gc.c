@@ -153,14 +153,8 @@ struct oldify_state {
 static value alloc_shared(caml_domain_state* d,
                           mlsize_t wosize, tag_t tag, reserved_t reserved)
 {
-  header_t hd = Make_header_with_reserved(wosize, tag,
-                                          caml_allocation_status(), reserved);
-  caml_placement_features features;
-  caml_placement_fill(&features, hd, d, CAML_PLACE_PROMOTION);
-  int arena = caml_placement_choose(&features);
-
-  void* mem = caml_shared_try_alloc_arena(d->shared_heap, wosize, tag,
-                                          reserved, arena);
+  value* mem = caml_placement_alloc(d->shared_heap, d, wosize, tag, reserved,
+                                    CAML_PLACE_PROMOTION);
   caml_update_major_allocated_words(
     d, Whsize_wosize(wosize), 0 /* promoted, not direct */);
   if (mem == NULL) {

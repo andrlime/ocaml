@@ -43,13 +43,11 @@ void caml_orphan_shared_heap(struct caml_heap_state* heap);
 void caml_free_shared_heap(struct caml_heap_state* heap);
 
 
-value* caml_shared_try_alloc(struct caml_heap_state*,
-                             mlsize_t, tag_t, reserved_t);
-
-/* Like caml_shared_try_alloc, but tries to place the object in [arena_id]
-   (a CAML_ARENA_* selector from caml/placement.h). Falls back to DRAM when the
-   requested arena cannot satisfy the request, so the allocation never fails for
-   want of far memory. */
+/* Allocate a [wosize]/[tag]/[reserved] block in [arena_id] (a CAML_ARENA_*
+   selector from caml/placement.h). Falls back to DRAM when the requested arena
+   cannot satisfy the request, so the allocation never fails for want of far
+   memory. Placement is normally decided by the policy via caml_placement_alloc;
+   call this directly only when a specific arena is required. */
 value* caml_shared_try_alloc_arena(struct caml_heap_state*,
                                    mlsize_t, tag_t, reserved_t, int arena_id);
 
