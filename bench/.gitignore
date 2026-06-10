@@ -8,3 +8,5 @@ noop.so
 benchmarks/ptrchase
 benchmarks/arraytraverse
 benchmarks/mixed
+build-stock/
+build-branch/
