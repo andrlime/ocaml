@@ -160,12 +160,47 @@ static const caml_placement_policy_ops *find_builtin(const char *name)
 }
 
 /* A spec naming a file -- rather than a built-in -- is a dynamic policy,
-   loaded by dlopen (not yet implemented; see Phase 3.1). */
+   loaded by dlopen. */
 static int looks_like_dynamic(const char *spec)
 {
   size_t len = strlen(spec);
   if (strchr(spec, '/') != NULL) return 1;
   return len >= 3 && strcmp(spec + len - 3, ".so") == 0;
+}
+
+/* Load a policy from the shared object at [path]: resolve the entry symbol,
+   fetch its descriptor, and reject an ABI mismatch. Returns NULL (logging the
+   reason) on any failure, so the caller falls back to the default policy. The
+   library is left mapped for the process lifetime, since the descriptor it
+   returns lives inside it. */
+static const caml_placement_policy_ops *load_dynamic(const char *path)
+{
+  char_os *path_os = caml_stat_strdup_to_os(path);
+  void *handle = caml_dlopen(path_os, 0);
+  caml_stat_free(path_os);
+  if (handle == NULL) {
+    caml_gc_log("placement: cannot load '%s': %s", path, caml_dlerror());
+    return NULL;
+  }
+
+  caml_placement_entry_fn entry =
+    (caml_placement_entry_fn)caml_dlsym(handle, "caml_placement_policy_entry");
+  if (entry == NULL) {
+    caml_gc_log("placement: '%s' exports no caml_placement_policy_entry", path);
+    return NULL;
+  }
+
+  const caml_placement_policy_ops *ops = entry();
+  if (ops == NULL || ops->choose_arena == NULL) {
+    caml_gc_log("placement: '%s' returned no usable policy", path);
+    return NULL;
+  }
+  if (ops->abi_version != CAML_PLACEMENT_ABI_VERSION) {
+    caml_gc_log("placement: '%s' is ABI v%u, runtime is v%u",
+                path, ops->abi_version, (unsigned)CAML_PLACEMENT_ABI_VERSION);
+    return NULL;
+  }
+  return ops;
 }
 
 static void install(const caml_placement_policy_ops *ops)
@@ -192,9 +227,11 @@ void caml_placement_init(void)
     }
 
     if (looks_like_dynamic(spec)) {
-      caml_gc_log("placement: dynamic policy '%s' ignored "
-                  "(dlopen support not yet built); using '%s'",
-                  spec, ops->name);
+      const caml_placement_policy_ops *loaded = load_dynamic(spec);
+      if (loaded != NULL)
+        ops = loaded;
+      else
+        caml_gc_log("placement: using '%s'", ops->name);
     } else {
       const caml_placement_policy_ops *found = find_builtin(spec);
       if (found != NULL)
