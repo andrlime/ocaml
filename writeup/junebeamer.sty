@@ -1,0 +1,83 @@
+% bland.sty — Minimal Beamer Theme
+% Usage:
+%   \usepackage{bland}
+%   \accentone{<color>}   e.g. \accentone[HTML]{8B0000}
+%   \accenttwo{<color>}   secondary — use \highlight{text} only
+
+\ProvidesPackage{junebeamer}[Beamer Theme]
+\RequirePackage{xcolor}
+
+% ---------- Defaults ----------
+\definecolor{BlandAccentOne}{RGB}{80, 57, 109}
+\definecolor{BlandAccentTwo}{RGB}{80, 57, 109}
+
+\newcommand{\accentone}[2][RGB]{\definecolor{BlandAccentOne}{#1}{#2}}
+\newcommand{\accenttwo}[2][RGB]{\definecolor{BlandAccentTwo}{#1}{#2}}
+
+% Use \highlight{} to apply accent two sparingly
+\newcommand{\highlight}[1]{{\color{BlandAccentTwo}#1}}
+
+% ---------- Base theme ----------
+\usetheme{default}
+\usecolortheme{default}
+\usefonttheme{serif}
+\setbeamertemplate{navigation symbols}{}
+
+% ---------- Colours ----------
+\setbeamercolor{background canvas}{bg=white}
+\setbeamercolor{normal text}{fg=black}
+\setbeamercolor{frametitle}{fg=BlandAccentOne, bg=white}
+\setbeamercolor{title}{fg=BlandAccentOne}
+\setbeamercolor{subtitle}{fg=black}
+\setbeamercolor{author}{fg=black}
+\setbeamercolor{date}{fg=black}
+\setbeamercolor{block title}{fg=white, bg=BlandAccentOne}
+\setbeamercolor{block body}{fg=black, bg=white}
+\setbeamercolor{itemize item}{fg=BlandAccentOne}
+\setbeamercolor{itemize subitem}{fg=BlandAccentOne}
+\setbeamercolor{enumerate item}{fg=BlandAccentOne}
+\setbeamercolor{enumerate subitem}{fg=BlandAccentOne}
+\setbeamercolor{section in toc}{fg=BlandAccentOne}
+
+% ---------- Fonts ----------
+\setbeamerfont{frametitle}{size=\large, series=\bfseries}
+\setbeamerfont{title}{size=\LARGE, series=\bfseries}
+\setbeamerfont{subtitle}{size=\normalsize, series=\normalfont}
+
+% ---------- Frametitle ----------
+\setbeamertemplate{frametitle}{%
+  \vspace{0.5em}%
+  \insertframetitle\par
+  \vspace{-0.25em}%
+  {\color{BlandAccentOne}\rule{\textwidth}{0.4pt}}%
+  \vspace{0.25em}%
+}
+
+% ---------- Title page ----------
+\setbeamertemplate{title page}{%
+  \vfill
+  \begin{center}
+    {\usebeamerfont{title}\usebeamercolor[fg]{title}\inserttitle\par}%
+    \vspace{0.5em}%
+    {\usebeamerfont{subtitle}\usebeamercolor[fg]{subtitle}\insertsubtitle\par}%
+    \vspace{1.5em}%
+    {\color{BlandAccentOne}\rule{0.4\textwidth}{0.4pt}\par}%
+    \vspace{1em}%
+    {\usebeamercolor[fg]{author}\insertauthor\par}%
+    \vspace{0.4em}%
+    {\usebeamercolor[fg]{date}\small\insertdate\par}%
+  \end{center}
+  \vfill
+}
+
+% ---------- Slide numbers ----------
+\setbeamertemplate{footline}{%
+  \hfill
+  {\color{black}\tiny\insertframenumber}%
+  \hspace{1em}%
+  \vspace{0.5em}%
+}
+
+% ---------- Items ----------
+\setbeamertemplate{itemize item}{{\color{BlandAccentOne}\textbullet}}
+\setbeamertemplate{itemize subitem}{{\color{BlandAccentOne}--}}

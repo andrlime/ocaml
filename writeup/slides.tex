@@ -1,0 +1,52 @@
+\documentclass[aspectratio=32, 9pt]{beamer}   % 3:2 — change to 169 for 16:9
+\usepackage{junebeamer}
+\usepackage{amsmath, amssymb}
+\usepackage{tikz}
+\usepackage{svg}
+
+\accentone[RGB]{78, 42, 132}          % dark red
+
+\title{Criticality-Aware Object Placement Across Tiered Memory in OCaml 5}
+\author{Andrew Li, Northwestern University}
+\date{CS 446, Spring Quarter 2026}
+
+\usepackage[style=acmnumeric, backend=biber]{biblatex}
+\addbibresource{references.bib}
+\newcommand{\bibliofont}{}
+
+\setbeamertemplate{footnote}{%
+  \tiny
+  \parindent 0pt\noindent
+  \insertfootnotemark~\insertfootnotetext\par
+}
+
+\newcommand{\slidecite}[1]{%
+  \footnote{\citeauthor{#1}, \citeyear{#1}}%
+}
+
+\addtobeamertemplate{footline}{}{%
+  \ifnum\insertframenumber>1
+    \begin{tikzpicture}[remember picture, overlay]
+      \node[anchor=south east, xshift=-0.3cm, yshift=0.18cm] at (current page.south east) {%
+        \includesvg[height=0.9cm]{northwestern}%
+      };
+    \end{tikzpicture}%
+  \fi
+}
+
+\setbeamercovered{transparent=25}
+
+\begin{document}
+
+\begin{frame}
+  \titlepage
+  \begin{tikzpicture}[remember picture, overlay]
+    \node[anchor=south west, xshift=0.3cm, yshift=0.3cm] at (current page.south west) {%
+      \includesvg[height=1.8cm]{northwestern}%
+    };
+  \end{tikzpicture}
+\end{frame}
+
+\include{slides/template.tex}
+
+\end{document}

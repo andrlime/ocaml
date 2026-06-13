@@ -1,0 +1,48 @@
+version: '3'
+
+tasks:
+  dev:
+    cmds:
+      - latexmk -pdf -interaction=nonstopmode -halt-on-error proposal.tex
+      - latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex
+  
+  slides:
+    cmds:
+      - latexmk -pdf -interaction=nonstopmode -halt-on-error -bibtex -shell-escape slides.tex
+
+  final:
+    cmds:
+      - latexmk -pdf -interaction=nonstopmode -halt-on-error -bibtex -shell-escape final_presentation.tex
+
+  prod:
+    cmds:
+      - task: dev
+      - task: clean
+  
+  prod-slides:
+    cmds:
+      - task: slides
+      - task: clean
+
+  prod-final:
+    cmds:
+      - task: final
+      - task: clean
+
+  all:
+    cmds:
+      - task: prod
+      - task: prod-slides
+      - task: prod-final
+
+  clean:
+    cmds:
+      - latexmk -c proposal.tex
+      - latexmk -c main.tex
+      - latexmk -c slides.tex
+      - latexmk -c final_presentation.tex
+      - rm *.bbl || true
+      - rm -r svg-inkscape || true
+      - rm *.nav || true
+      - rm *.snm || true
+      - rm **/*.aux || true

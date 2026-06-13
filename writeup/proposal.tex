@@ -1,0 +1,96 @@
+\documentclass[sigconf]{acmart}
+
+%% Suppress ACM reference format and copyright footer for class use
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+\begin{document}
+\title{Criticality-Aware Object Placement Across Tiered Memory in OCaml 5}
+
+\author{Andrew Li}
+\affiliation{%
+  \institution{Northwestern University}
+  \city{Evanston}
+  \state{IL}
+  \country{USA}
+}
+\email{andrewli@u.northwestern.edu}
+
+% \begin{abstract}
+% TODO
+
+% \end{abstract}
+
+% \keywords{OCaml, garbage collection, far memory, CXL, NUMA}
+
+\maketitle
+
+\section{Background}
+
+Data intensive workloads consume large quantities of DRAM, which is increasingly expensive given the growth of AI data centers. This memory bottleneck motivates a transition to heterogeneous memory hierarchies, where local DRAM is augmented by cheaper ``far memory'' tiers like Compute Express Link (CXL)-attached memory~\cite{cxl2024}. Traditional OS-level paging lacks insight into application object structures, leading to suboptimal placement of memory into pages across memory tiers. Heuristically, it may seem reasonable to place objects based on hotness or access frequency~\cite{merchandiser2023}, but modern research has shifted towards criticality-based paging, which uses not just hotness as a heuristic but also memory-level parallelism (MLP). The intuition behind criticality-based policies is that some data structures may be more friendly towards hardware-level parallel accesses, while other data structure with heavy pointer chasing are not. The OS has no understanding of these data structures, only language runtimes do. Managed runtimes with garbage collection (GC) leverage OS-level paging mechanisms to manage large heaps of data structures with varying degrees of MLP; this object mobility is a fundamental advantage of managed over unmanaged languages~\cite{alaska2024}. Optimal paging of these data structures is critical for applications written in high-level programming languages such as Python, Julia, Haskell, and OCaml. Frameworks at the OS-level, such as PACT with a Per-page Access Criticality metric~\cite{pact2026}, are insufficient for runtimes themselves.
+
+\section{Project}
+
+The project is to introduce compiler support for runtime-level criticality metrics that enable placement of data structures on heaps spanning various tiers of memory. This project requires modification of both the garbage collector and compiler for a production language. We choose to use OCaml 5~\cite{ocaml5gc2020} because its concurrency offers a interesting level of multi-core complexity. OCaml's garbage collector is inherently tiered which makes it intuitively well-suited for research on tiered memory. A drawback of using OCaml is that its compiler does not use LLVM as a backend, which makes an attribute-based modification harder to robustly compare with other languages. We leave this as future work.
+
+At the garbage collector level, we modify the OCaml runtime to support both main-memory major heap pages and far-memory major heap pages. The design of the OCaml garbage collector is with a stop-the-world (STW) minor heap that is, by default, 2 MB in size. Once the minor heap fills, all live objects are promoted to the major heap. The first half of the project is to re-engineer the promotion step to support both promotion to a main-memory major heap page \text{it} or a far-memory major heap page. The second half of the project is at the compiler level, where we introduce attributes like \texttt{[@far\_memory]} to support transparent paging, which contrasts from similar compiler work like TrackFM~\cite{trackfm2024} that relies on unmodified code. The difference is that, lacking annotations, TrackFM must be more middle-end, whereas the introduction of attributes enables a more front-end level contribution.
+
+\section{Implementation Plan \& Timeline}
+
+The project is naturally split into two halves. The first half is runtime, garbage collection, and memory management. At a high level, the specific aims are
+\begin{enumerate}
+  \item Modify the runtime to support multiple tiers of major-heap pages spanning both DRAM and CXL-based far memory. We can simulate far memory as a NUMA node with an added Gaussian latency.
+  \item \textit{Identify} criticality metrics that can be used at a runtime level, taking inspiration from prior work such as PACT~\cite{pact2026}.
+  \item Implement these criticality metrics at the runtime level, incorporating both access frequency (hotness) and MLP.
+  \item Re-engineer the minor heap promotion step to make placement decisions and promote live objects to either a main-memory or far-memory major heap page based on criticality metrics.
+\end{enumerate}
+
+The second half is OCaml compiler front-end modifications.
+\begin{enumerate}
+  \item Introduce source-level attributes (e.g., [@far\_memory]) in the OCaml frontend that annotate data structure allocations with placement hints.
+  \item Thread these attributes through the compiler pipeline such that they are visible at allocation sites in the runtime. The most likely implementation of this is to somehow embed source-level attributes in the metadata bits of each object. If there are insufficient bits for this, other means must be explored.
+  \item Ensure the GC respects these source-level attributes when making placement decisions.
+\end{enumerate}
+
+\subsection{Timeline}
+\begin{description}
+  \item[Week 4 (4/20-4/26) --- Runtime scaffolding] Modify the OCaml runtime to support two major-heap arenas: one backed by local DRAM and one by a NUMA node with injected Gaussian latency simulating CXL. Spawn a VM with NUMA nodes. Use \texttt{mmap} to create the two separate arenas. Verify allocation and GC correctness by writing and running some basic programs, as well as some memory intensive programs, and maybe by force triggering the GC. The author's code from Advent of Code 2025 may contain useful programs to run.\footnote{https://github.com/andrlime/aoc2025}
+  \item[Week 5 (4/27-5/3) --- Promotion path] Re-engineer the minor heap promotion step to route live objects to either arena. Use a trivial policy (e.g., round-robin) initially to confirm end-to-end plumbing.
+  \item[Week 6 (5/4-5/10) --- Criticality metrics] Identify and implement runtime-level PAC-inspired metrics: per-object hotness counters and an MLP proxy (e.g., outstanding load depth at GC time). Wire metrics into the promotion decision.
+  \item[Week 7 (5/11-5/17) --- Compiler attributes] Add \texttt{[@far\_memory]} and \texttt{[@main\_memory]} as recognised attributes in the OCaml parser and typechecker. Propagate it through the lambda and Cmm IRs and embed it in the object header or a side table visible at allocation sites.
+  \item[Week 8 (5/18-5/24) --- GC integration] Make the GC read the embedded attribute and override or bias the heuristic placement decision. Validate correctness on small hand-written tests with known MLP profiles.
+  \item[Week 9 (5/25-5/31) --- Evaluation] Write and run benchmarks: pointer-chasing (low MLP) and array-traversal (high MLP) workloads under memory pressure. Collect results for all four conditions (all-main, all-far, heuristic, attributed). Make figures.
+  \item[Week 10 (6/1-6/9) --- Buffer] Polish benchmarks based on preliminary results. Since the author will be starting their internship around this time, talk to devs in the trading industry to get a sense of what they care about, and if time permits, implement it.
+\end{description}
+
+\section{Evaluation}
+The project will be evaluated by evaluating the attribute-based approach against the runtime-only heuristic baseline, measuring performance on data-intensive OCaml workloads. Specifically, we will write workloads that use both low and high MLP data structures under high memory pressure. We can achieve memory pressure by lowering the size of the heaps. A baseline is to run the workload on high DRAM machines without memory pressure, which is the upper bound of performance. The negative control is to have every page promoted to far memory, which will have worse performance than the baseline due to the access latencies of the CXL-based (albeit emulated) memory. Our experiments are thus to
+\begin{enumerate}
+  \item Measure the effect on performance by using heuristics to place objects across tiered memory pages. The hypothesis is that heuristics are sufficient to increase performance relative to the all-far control.
+  \item Measure the effect on performance by using compiler frontend attributes inserted by the programmer. The hypothesis is that these hand-written attributes increase performance more compared to the heuristics-only approach, and can achieve performance close to the all-main baseline.
+\end{enumerate}
+
+\section{Contributions}
+Our contributions are
+\begin{enumerate}
+  \item Compiler frontend patch, and garbage collector patch that enables both automatic, heuristics-based and manual, attributes-based placement of objects on heap pages spanning tiered memory.
+  \item Custom-written benchmarks based on existing benchmarks from similar work, ported to OCaml, and both with and without attributes.
+\end{enumerate}
+
+\section{Team}
+\begin{description}
+  \item[Andrew Li] The author is interested in networking and distributed systems, compilers, and high performance scientific computing. The author will be interning at a trading company starting May 26. The author therefore will need to present the final presentation over Zoom.
+\end{description}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\appendix
+\section{Gemini Deep Research}
+\texttt{https://gemini.google.com/share/f3387fef346c}
+
+\section{AI Usage Policy}
+This project will be a yes-AI project. It is anticipiated that the benchmarks will not be written using AI.
+
+\end{document}
