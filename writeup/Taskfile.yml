@@ -4,7 +4,7 @@ tasks:
   dev:
     cmds:
       - latexmk -pdf -interaction=nonstopmode -halt-on-error proposal.tex
-      - latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex
+      - latexmk -pdf -interaction=nonstopmode -halt-on-error writeup.tex
   
   slides:
     cmds:
@@ -38,7 +38,7 @@ tasks:
   clean:
     cmds:
       - latexmk -c proposal.tex
-      - latexmk -c main.tex
+      - latexmk -c writeup.tex
       - latexmk -c slides.tex
       - latexmk -c final_presentation.tex
       - rm *.bbl || true

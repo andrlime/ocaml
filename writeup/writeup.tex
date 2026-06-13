@@ -6,10 +6,11 @@
 \pagestyle{plain}
 
 \usepackage{graphicx}
+\usepackage{booktabs}
 \graphicspath{{figures_new/}{figures/}}
 
 \begin{document}
-\title{Programmable Criticality-Aware Object Placement Across Tiered Memory in OCaml~5}
+\title{Programmable Object Placement Across Tiered Memory in OCaml~5}
 
 \author{Andrew Li}
 \affiliation{%
@@ -24,25 +25,18 @@
 Data-intensive workloads are increasingly bottlenecked on DRAM capacity,
 motivating heterogeneous memory hierarchies in which local DRAM is augmented by
 cheaper, slower ``far memory'' tiers such as CXL-attached memory. OS-level
-paging is blind to application object structure and so places memory poorly;
-recent work argues for \emph{criticality}-based placement that accounts not just
+paging is blind to application object structure and places data of higher-level programming languages poorly.
+Recent work argues for \emph{criticality}-based placement that accounts not just
 for hotness but for memory-level parallelism (MLP). Only the language runtime
 knows enough about object structure to make these decisions well. We present a
 framework for \emph{programmable} garbage-collector object placement across
-tiered memory in OCaml~5 --- in effect \emph{\texttt{sched\_ext} for GC
-placement}. The runtime supplies all mechanism (arenas, promotion, pointer
-fixup, fact collection); a user-supplied \emph{policy} --- a single pure C
-function, loaded as a built-in or \texttt{dlopen}'d \texttt{.so} --- supplies
-only judgment: given cheap facts about one object, which tier should it live in.
-We additionally thread \texttt{[@far\_memory]}/\texttt{[@main\_memory]} source
-attributes through the compiler so programmers can place objects by hand. On an
-emulated CXL device (far memory $4.6\times$ higher access latency and
-$\sim\!4.5\times$ lower read bandwidth than DRAM), the framework adds no
-measurable overhead over stock OCaml, a placement decision costs $\sim\!2$~ns
-(the \texttt{dlopen} indirection adds only a few tenths of a nanosecond), and
-under a DRAM cap at half the working-set footprint a criticality-aware policy
-recovers most of the all-in-DRAM performance while a naive all-far placement is
-up to $2.4\times$ slower.
+tiered memory in OCaml~5. The runtime supplies all mechanism (arenas, promotion, pointer
+fixup, fact collection) as per the vanilla OCaml garbage collector; a user-supplied \emph{policy}, a set of pure C functions,
+is dynamically loaded at runtime. The garbage collector backend supplies cheap facts about objects and asks the C library to decide
+the tier of memory for placement. We additionally thread \texttt{[@far\_memory]}/\texttt{[@main\_memory]} source
+attributes through the compiler so programmers can provide hints for their policies.
+We show that on an emulated CXL device, the framework adds little overhead over stock OCaml, and is a simple interface for researchers to prototype
+garbage collection policies without the need to recompile the entire language.
 \end{abstract}
 
 \keywords{OCaml, garbage collection, far memory, CXL, tiered memory, object placement}
@@ -63,326 +57,219 @@ research has shifted toward criticality-based paging, which uses not just hotnes
 but also memory-level parallelism (MLP). The intuition is that some data
 structures are friendly to hardware-level parallel access while others ---
 pointer-chasing structures in particular --- are not, so that the same access
-frequency can hide very different amounts of latency. The OS understands none of
-this; only language runtimes do. Managed runtimes with garbage collection (GC)
-already relocate objects freely, and this object mobility is a fundamental
-advantage of managed over unmanaged languages~\cite{alaska2024}. OS-level
-frameworks such as PACT, with its Per-page Access Criticality
-metric~\cite{pact2026}, are necessarily blind to the runtime's structural
-knowledge.
+frequency can hide very different amounts of measured latency. The OS does not understand nor care
+about these notions of object accesss; only language runtimes do. Managed runtimes with garbage collection (GC)
+already relocate objects, and this object mobility is an advantage of managed over unmanaged languages~\cite{alaska2024}.
+OS-level frameworks such as PACT, with its Per-page Access Criticality metric~\cite{pact2026} are an improvement over
+pure hotness-based heuristics, but are still blind to the runtime's structural knowledge.
 
-\section{From a heuristic to a framework}
-
-The original proposal for this project aimed to discover \emph{the} winning
-runtime-level criticality heuristic and bake it into the OCaml GC. Three
-weaknesses doomed that framing: criticality metrics are genuinely hard to
-engineer; even good metrics are hard to find and validate; and a single baked-in
-heuristic is hard to review and easy to get subtly wrong. We therefore pivoted.
-
-The contribution of this work is the \textbf{framework}, not any one heuristic.
-We build a strict \emph{mechanism/policy split} --- in spirit, \texttt{sched\_ext}
-for GC placement. The runtime (the ``engine'') owns all mechanism: when GC runs,
-arena mapping, pool freelists, promotion atomicity, pointer fixup, thread
-coordination, the computation of cheap per-object \emph{facts}, and --- crucially
---- the defense of heap correctness. A \emph{policy} owns exactly one thing: the
-decision \texttt{features}~$\rightarrow$~\texttt{arena}. The headline results are
-therefore \emph{expressiveness} (many distinct policies are expressible, tiny,
-across three authoring surfaces) and \emph{overhead} (the framework hosts them at
-near-zero cost), rather than ``our heuristic wins.'' Whether any particular
-policy wins is then an empirical question the framework lets us ask cheaply.
-
-We target OCaml~5~\cite{ocaml5gc2020} because its multicore, concurrent GC makes
-the placement plumbing genuinely hard (placement decisions fire mid-collection,
-concurrently across domains), and because its generational, copying minor heap
-already promotes live objects to a major heap --- a natural seam at which to
-choose a tier.
-
-\section{Design}
-
-\subsection{Mechanism/policy split}
-
-Calls go one direction only: \textbf{engine~$\rightarrow$~policy}. The policy is
-a passive callback table; it may never re-enter the runtime. The engine fills a
-\texttt{caml\_placement\_features} struct on its own C stack and calls
-\texttt{choose\_arena(const features*)}; the only value flowing back is an
-\texttt{int} arena id. There is no serialization, no IPC, and no copy --- the
-policy \texttt{.so} is \texttt{dlopen}'d into the same address space and shares
-an identical struct layout guaranteed by a single header,
-\texttt{runtime/caml/placement.h}. A one-time back-channel,
-\texttt{features\_needed}, read once at \texttt{init}, lets a policy declare
-which non-free facts are worth computing, so policies that do not want an
-expensive fact never pay for it.
-
-\subsection{The policy contract: a pure function}
-
-The entire contract is one sentence: \texttt{choose\_arena} is a \emph{pure
-function} of its \texttt{features} argument plus immutable configuration read at
-\texttt{init} --- no mutable state, no domain-local scratch, no atomics. This
-single constraint buys a great deal:
-
-\begin{itemize}
-  \item \textbf{No concurrency protection.} \texttt{choose\_arena} runs
-  concurrently across domains during stop-the-world minor GC, but a pure
-  function under concurrent calls has nothing to race on --- no locks, no
-  reentrancy hedging.
-  \item \textbf{History for free.} A policy that wants aggregate history reads it
-  from the \texttt{arena\_used[]} snapshot the engine already places in
-  \texttt{features}; it maintains nothing itself.
-  \item \textbf{Determinism is not load-bearing for correctness.} Under the
-  promotion race, several domains may speculatively place the same object; a
-  compare-and-swap picks one arbitrary winner and the losers abandon their
-  copies. The heap is correct regardless of which arena the winner chose. A pure
-  function of an object's immutable features happens to be deterministic too,
-  which is convenient for reproducibility, but integrity does not depend on it.
-\end{itemize}
-
-The callback fires mid-collection, while the heap is in an inconsistent
-intermediate state (forwarding pointers, in-progress headers, the minor heap
-being drained). Running OCaml there would allocate and could trigger a nested GC,
-corrupting the heap. The callback is therefore \textbf{non-allocating C}. OCaml
-authoring is still available, but safely: via source attributes (below), and a
-deferred pure-expression DSL.
-
-\subsection{The data model}
-
-The engine fills a \texttt{caml\_placement\_features} record per object. We
-populate a \emph{Tier-0} set of facts that are essentially free because the
-engine already has them in hand at the promotion site --- among them the object's
-size in words (\texttt{wosize}), its \texttt{tag}, a \texttt{scannable} bit
-(1~=~pointer-bearing, a free \emph{low}-MLP proxy; 0~=~flat/\texttt{No\_scan}, a
-free \emph{high}-MLP proxy), the compiler \texttt{hint} read from reserved header
-bits, the allocating domain, minor-heap occupancy, and the live-words-per-arena
-snapshot. Higher tiers --- structural facts (\texttt{fanout},
-\texttt{chain\_depth}), write counts, allocation-site provenance, and PEBS-sampled
-read hotness --- are present in the struct but zero, gated behind
-\texttt{features\_needed} flags, so they can be enabled later with no ABI break.
-
-The policy returns its descriptor through one exported symbol:
-
-\begin{quote}\small\ttfamily
-const caml\_placement\_policy\_ops *\\
-\hspace*{1em}caml\_placement\_policy\_entry(void);
-\end{quote}
-
-\noindent
-The descriptor carries an \texttt{abi\_version}, a \texttt{name},
-\texttt{features\_needed}, and the callbacks (\texttt{init}, the required
-\texttt{choose\_arena}, optional \texttt{after\_minor} telemetry, a reserved
-\texttt{should\_migrate}, and \texttt{shutdown}). The ABI is append-only: new
-fields go before a reserved tail, existing offsets never move, and a new feature
-flag is just a new bit that old policies do not set --- so the engine skips that
-work and they pay nothing. The version is bumped only on a layout-breaking
-change, and the load-time check then refuses a stale \texttt{.so} with a clear
-error rather than crashing.
-
-\subsection{Registration and loading}
-
-A single environment variable, \texttt{CAML\_GC\_POLICY}, is resolved at GC init
-before domains spawn. A value containing a slash or ending in \texttt{.so} is
-\texttt{dlopen}'d and its entry symbol resolved; otherwise the name is looked up
-in a static built-in table; unset falls back to \texttt{all\_dram}, a
-single-arena policy that behaves exactly like stock OCaml --- the safe baseline.
-The active descriptor lives in a read-mostly global, set once and read lock-free
-on the hot path. The user's compiled OCaml program is byte-for-byte identical
-regardless of policy: loading happens in the runtime at process start, decoupled
-from compilation.
-
-\subsection{Two arenas}
-
-The foundation is a behavior-preserving refactor of the shared-heap pool
-allocator so that all existing allocation flows through arena~0 (DRAM); the full
-testsuite gates this risky change. A second arena (far) is then mapped and, where
-available, bound to a far-memory device, with graceful fallback to a plain
-mapping where no such device exists --- so the whole framework is testable on any
-machine, and a far-memory device is needed only for the performance numbers. As
-the proposal anticipated, far memory is emulated not by injected latency in the
-runtime but by the device topology of the host. The promotion path fills Tier-0
-\texttt{features}, calls the policy, and routes the object to the chosen arena,
-falling back to the other arena if the chosen one is full so the no-fail
-promotion invariant is preserved.
-
-\subsection{Compiler attributes}
-
-For manual placement we thread two source attributes,
-\texttt{[@far\_memory]} and \texttt{[@main\_memory]}, through the entire compiler
-pipeline. They are registered as known built-in attributes (so no spurious
-warning), threaded through the Lambda IR by extending \texttt{Pmakeblock} to
-carry a memory hint, and lowered through Clambda/Cmm so the allocation's
-\texttt{reserved} header argument is set on the minor-heap fast path. The GC then
-reads the hint from the object header at promotion time. The tree is configured
-with \texttt{--enable-reserved-header-bits=2} so that the baseline and attributed
-conditions share one ABI and the comparison is fair. The built-in
-\texttt{attribute} policy honors the hint (\texttt{FAR}~$\rightarrow$~far,
-\texttt{MAIN}~$\rightarrow$~DRAM) and defers to a configurable sub-policy for
-unannotated objects.
-
-\section{Implementation}
-
-The work landed commit-by-commit on a single branch, with the discipline that
-\textbf{every commit builds and passes its stated test} and the public contract
-is frozen in one reviewed header. The delivered scope is: the contract and
-scaffolding; the two-arena foundation and per-arena accounting; the Tier-0
-promotion and direct-allocation wiring; the built-in policies
-(\texttt{all\_dram}, \texttt{all\_far}, \texttt{size\_threshold},
-\texttt{flat\_far}, \texttt{attribute}); the \texttt{dlopen} resolver with example
-policies and a documented write~$\rightarrow$~compile~$\rightarrow$~load workflow;
-and the full compiler-attribute path. Migration (far~$\rightarrow$~near), the
-higher feature tiers, and the OCaml expression-DSL surface are designed for and
-ABI-ready but deferred.
-
-A built-in policy is a few lines of C; a loadable one is the same plus an
-exported entry symbol. The trivial DRAM-only policy used to isolate
-\texttt{dlopen} cost is its entire substance:
-
-\begin{quote}\small\ttfamily
-static int choose\_arena(const caml\_placement\_features *f)\\
-\hspace*{1em}\{ (void) f; return CAML\_ARENA\_DRAM; \}
-\end{quote}
-
-\section{Evaluation}
-
-We evaluate on a host with a real far-memory device. We ask three questions in
-order: do the tiers genuinely differ; is the framework free; and can policies
-actually steer placement to recover performance under memory pressure.
-
-\subsection{The tiers genuinely differ}
-
-Figure~\ref{fig:hw} characterizes the two tiers with a microbenchmark. Random
-read latency is $115$~ns on DRAM versus $524$~ns on far memory --- $4.6\times$
-slower. Sequential read bandwidth is $9.4$~GB/s versus $2.1$~GB/s --- $4.5\times$
-less; write bandwidth is $10.1$~GB/s versus $1.7$~GB/s. This is a meaningful tier
-gap, of the same order reported for CXL-attached memory, and it is what placement
-decisions are trading against.
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\columnwidth]{fig3_hardware_comparison.png}
-  \caption{The two memory tiers genuinely differ. Far memory has $4.6\times$ the
-  random-access latency and $\sim\!4.5\times$ less read bandwidth than DRAM.}
-  \label{fig:hw}
-\end{figure}
-
-\subsection{The framework is free}
-
-With \texttt{all\_dram} the runtime is behaviorally identical to stock OCaml and
-we measure no wall-time overhead over an unmodified compiler: the placement seam
-is dormant when the policy never sends anything far.
-
-The per-decision cost is the more pointed question, since \texttt{choose\_arena}
-fires once per promoted object. Figure~\ref{fig:cost} measures it directly,
-reporting the median of 100 runs with interquartile error bars. A decision costs
-about $2$~ns when the policy is compiled in, and the \texttt{dlopen}'d loadable
-policy costs only a few tenths of a nanosecond more --- the cost of one
-well-predicted indirect call. Against a far-access latency of hundreds of
-nanoseconds, the decision is effectively free; the framework's flexibility does
-not come at the price of a hot-path tax.
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\columnwidth]{fig5_overhead.png}
-  \caption{A placement decision costs $\sim\!2$~ns. Making the policy a loadable
-  \texttt{dlopen}'d \texttt{.so} rather than a compiled-in built-in adds only the
-  cost of one indirect call.}
-  \label{fig:cost}
-\end{figure}
-
-\subsection{Policies steer, and steering pays under pressure}
-
-The substantive question is whether \emph{which tier an object lands in} matters,
-and whether a cheap structural policy can exploit it. We run three workloads ---
-\texttt{ptrchase} (pointer chasing, low MLP), \texttt{arraytraverse} (flat array
-traversal, high MLP), and a \texttt{mixed} workload --- under a DRAM cap set to
-roughly half the working-set footprint, and normalize wall time to the
-all-in-DRAM, no-pressure run (Figure~\ref{fig:spread}).
-
-Three behaviors emerge. On \texttt{arraytraverse}, every policy --- including
-\texttt{all\_far} --- sits at $\sim\!1.0$: a flat, sequentially streamed,
-high-MLP structure tolerates the far tier almost perfectly, so placement barely
-matters and even pushing everything far is fine. On the two latency-sensitive
-workloads, the spread is wide. For \texttt{mixed}, naive \texttt{all\_far} is
-$2.4\times$ slower than the baseline, but \texttt{flat\_far} --- which keeps
-pointer-bearing (low-MLP) objects in DRAM and sends only flat objects far ---
-lands at $1.08\times$, recovering nearly all of the lost performance, and even
-edges out \texttt{all\_dram} under the cap because \texttt{all\_dram} is forced to
-spill indiscriminately once DRAM fills. For \texttt{ptrchase},
-\texttt{all\_far} is $1.9\times$ slower while a \texttt{size\_threshold} policy
-returns essentially to the baseline. In short, the right cheap Tier-0 policy
-recovers most of the all-in-DRAM performance, and no single policy is best across
-all workloads --- which is precisely the argument for a framework that makes the
-policy swappable rather than for one baked-in heuristic.
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\columnwidth]{fig1_policies_work.png}
-  \caption{Policy spread at a $\sim\!50\%$-of-footprint DRAM cap, normalized to
-  all-in-DRAM with no pressure (dashed line). Criticality-aware policies
-  (\texttt{flat\_far}, \texttt{size\_threshold}) recover most of the envelope on
-  latency-sensitive workloads, while naive \texttt{all\_far} is up to $2.4\times$
-  slower. On the high-MLP \texttt{arraytraverse}, placement barely matters.}
-  \label{fig:spread}
-\end{figure}
-
-\subsection{Discussion}
-
-The arena-occupancy accounting confirms the steering is real and not an artifact
-of timing noise: occupancy splits between the tiers exactly as each policy
-intends. The win, as expected, grows as DRAM grows scarcer --- at a generous cap
-the policies converge, and they diverge as the cap tightens and the far tier's
-latency is exposed. The \texttt{arraytraverse} result is a useful negative: it
-shows the framework is measuring something real (a high-MLP structure is
-genuinely indifferent to tier) rather than always rewarding ``more DRAM.''
-
-\section{Related work}
+\subsection{Related work}
 
 PACT~\cite{pact2026} argues for criticality-first tiered-memory placement but
 operates at the OS page level, blind to runtime object structure.
 TrackFM~\cite{trackfm2024} provides compiler support for far memory over
-unmodified code and therefore works in the middle-end; our attribute path is a
-more front-end contribution that lets the programmer state intent directly.
+unmodified code and therefore works in the middle-end; our attributes are a
+more front-end contribution that lets the programmer state intent directly, similar to \texttt{[[likely]]} and \texttt{[[unlikely]]} from C++.
 Merchandiser~\cite{merchandiser2023} places data on heterogeneous memory by
 hotness and load balance. ALASKA~\cite{alaska2024} highlights object mobility as
 the lever managed runtimes have and unmanaged ones lack. We sit one layer below
-all of these: rather than ship a placement policy, we ship the runtime
-\emph{mechanism} that lets a policy --- built-in, \texttt{dlopen}'d, or expressed
-via source attributes --- be written, swapped, and measured at near-zero cost.
+all of these: rather than ship a specific placement policy, we ship the runtime
+\emph{mechanism} that lets a policy be written, swapped, and measured at near zero cost. The \emph{handle} abstraction~\cite{alaska2024} gives unmanaged runtimes the same object-relocation freedom GCs have natively, and is directly relevant to future migration support in our framework.
 
-\section{Contributions}
+\subsection{Contribution}
 
+The contribution of this work is a \textbf{framework} and tiered design, not any one heuristic.
+The runtime owns the backend of the garbage collector --- arena \texttt{mmap}-ing, underlying promotion mechanism, pointer fixup,
+thread coordination, bump allocation, and all of the work that existing garbage collectors do well.
+The policy is, in a sense, the frontend of the garbage collector, as it is the behavior that surfaces most directly
+to the developer of higher level software. The policy is completely agnostic of the garbage collector backend and receives
+metadata about objects that the backend knows to make a decision on which heap an object should be placed in. This is an increased expressiveness in policy
+as hypotheses can be tested by writing singular \texttt{.so} libraries in C to dynamically link into pre-compiled programs. Whether any particular
+policy wins is then an empirical question the framework lets us ask for cheaper than before.
+
+We target OCaml~5~\cite{ocaml5gc2020} because its multicore, concurrent GC makes
+the placement plumbing difficult, and because its generational so copying minor heap
+already promotes live objects to a major heap. That property of being generational creates an inherent tiered design that
+further tiering can naturally build upon.
+
+Here, we introduce a place for further development that this work does not touch on in the slighest. The generational nature of OCaml 5's vanilla garbage collector is in essense a parent-child relationship. With the introduction of more memory tiers, this relationship between tiers can be expanded into entire family trees, and objects being moved across heap boundaries can be expanded from minor-to-major to heap-to-heap. That may depend on object handles to abstract away addresses, which has been proven as a concept in prior work~\cite{alaska2024}.
+
+\section{Design}
+
+\subsection{Mechanism/Policy Split}
+
+Calls into a policy are unidirectional: the engine calls the policy. The policy is propagated to the engine as a a passive callback table of function pointers, each of which is a (usually) pure function that takes a metadata struct for the object in question and decides where to place it. The policy has no control over the backend. The significance of this design is that the policy is entirely sandboxed away from the garbage collector's backend. The rationale for why this is an improvement over tight coupling is that the policy is sandboxed from GC internals: it cannot allocate, cannot call back into the runtime, and the engine clamps its return value so a misbehaving policy degrades placement quality without threatening heap integrity. Purity also makes policies independently testable without a tight dependency on the OCaml GC backend.
+
+Crucially, there is no byte serialization, no IPC, no shared memory, no ring buffer --- no overhead other than loading the dynamic library using \texttt{dlopen}'d into the same address space. This is guaranteed by a single header, \texttt{runtime/caml/placement.h}.
+A one-time back-channel, \texttt{features\_needed}, read once at \texttt{init}, lets a policy declare which non-free facts are worth computing, so policies that do not want an
+expensive fact never pay for it. At this stage of the project, none of those features are implemented, so this back-channel is a fancy nop.
+
+\subsection{The Policy Contract}
+
+The design of the policy, as hinted, can be described in a single sentence. The \texttt{choose\_arena} function is pure
+\begin{align}
+  \texttt{choose\_arena} : \texttt{features} \to \texttt{heap}
+\end{align}
+The intention is that the function is completely stateless. As each policy is its own translation unit, there is nothing fundamentally stopping
+a developer from encoding state as global variables, though that is not the intent of the design. There certainly exists policies for which global storage may be beneficial.
+
+The benefits of purity are straightforward:
+\begin{itemize}
+  \item \textbf{No concurrency protection.} While the OCaml 5 GC is parallel, if \texttt{choose\_arena} is pure, then it will never race.
+  \item \textbf{History for free.} A policy that wants aggregate history reads it from the \texttt{arena\_used[]} snapshot the engine already places in
+  \texttt{features}. Certainly a complex policy could want more detailed history, which is one instance where mutable state may be justified.
+\end{itemize}
+
+It was considered to create an OCaml API for the policy, but because the callback fires mid-collection while the heap is in an intermediate state (forwarding pointers, in-progress headers, the minor heap being drained). Running OCaml code at this stage would create a dependency cycle and could trigger a nested GC, which would corrupt the heap (it is unclear what exactly would happen). The callback is therefore \textbf{non-allocating C}, though it is possible to create higher-level DSLs that compile down to C, which could increase robustness of tracking state in mutable global variables.
+
+\subsection{Features}
+
+The GC backend fills a \texttt{caml\_placement\_features} record per object. There are facts stored here that are free because the GC already has them elsewhere or can trivially compute them, but either does not calculate them or does not have them in one place. Among these facts include the object's size in words (\texttt{wosize}), its \texttt{tag}, a \texttt{scannable} bit (1~=~pointer-bearing, a free \emph{low}-MLP proxy; 0~=~flat/\texttt{No\_scan}, a free \emph{high}-MLP proxy), the compiler \texttt{hint} read from reserved header bits, the allocating domain, minor-heap occupancy, and the live-words-per-arena
+snapshot. Room for more expensive data is reserved, though are not implemented. If further data is to be added, the simple flat struct may need to be redesigned to align to cache lines, though this direction is unexplored.
+
+Policies compiled in-between changes to the features struct may expect different struct sizes and offsets, which would create ABI problems. There can be improved input sanitisation done on the \texttt{.so} including encoding binary information in the data section, but this is not necessary for this proof of concept.
+
+\begin{table}[h]
+\small
+\caption{Cheap, implemented fields of \texttt{caml\_placement\_features}}
+\label{tab:features}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Field & Type & Description \\
+\midrule
+\texttt{wosize} & \texttt{mlsize\_t} & Size in words \\
+\texttt{tag} & \texttt{tag\_t} & Object tag (0--255) \\
+\texttt{scannable} & \texttt{uint8\_t} & 1 = pointer-bearing (low MLP); 0 = flat (high MLP) \\
+\texttt{hint} & \texttt{uint8\_t} & Compiler attribute: \texttt{NONE} / \texttt{MAIN} / \texttt{FAR} \\
+\texttt{site} & \texttt{uint8\_t} & \texttt{PROMOTION} vs.\ \texttt{DIRECT} \\
+\texttt{color} & \texttt{uint8\_t} & GC color bits \\
+\texttt{domain} & \texttt{int} & Allocating domain id \\
+\texttt{minor\_used} & \texttt{uintnat} & Words used in minor heap this cycle \\
+\texttt{minor\_size} & \texttt{uintnat} & Minor heap capacity in words \\
+\texttt{arena\_used[2]} & \texttt{uintnat[]} & Live words per arena (aggregate snapshot) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Registration and Loading}
+
+A single environment variable \texttt{CAML\_GC\_POLICY} is resolved at GC init before domains spawn. Values that could plausibly be paths to shared objects are \texttt{dlopen}'d and resolved, otherwise looked up in a built in table of default policies that are compiled into the runtime itself. The default is to fall back to \texttt{all\_dram}, a
+single-arena policy that behaves exactly like stock OCaml. Crucially, the user's compiled OCaml programs are byte-for-byte identical regardless of policy: loading happens in the runtime at process start, decoupled from compilation.
+
+\subsection{Compiler Attributes}
+
+For manual placement we thread two source attributes,
+\texttt{[@far\_memory]} and \texttt{[@main\_memory]}, through the entire compiler
+pipeline. They are registered as known built-in attributes. The GC then
+reads the hint from the object header at promotion time. Policies are not required to abide by
+compiler hints, though doing so is a simple check of the \texttt{hint} feature, which incurs the cost of a single branch.
+
+\section{Deliverable}
+
+The deliverable is the contract and scaffolding, the infrastructure that \texttt{mmap}'s the non-DRAM heap, some simple policies, and the infrastructure that dynamically loads policies from \texttt{.so} files. A built-in policy is a few lines of C; a loadable one is the same plus an exported entry symbol.
+
+\section{Evaluation}
+
+We evaluate on a host with 800 GB Optane DAX (direct addressable) hardware which was shown through experimentation to be persistent, though that attribute is unused for the GC policies. We focus on four questions: do the tiers differ enough that the DAX memory acts as a proxy for CXL-based memory, how expensive is the framework, do policies affect performance, and what is the developer experience to implement a new policy.
+
+\subsection{Memory Tier Characterization}
+
+First, we verify that the two tiers are meaningfully different in latency and bandwidth. Figure~\ref{fig:hardware} shows bandwidth and latency for sequential and random access patterns on DRAM and the Optane DAX partition used as the far tier. The DAX tier achieves substantially lower peak bandwidth and higher read latency than local DRAM, consistent with published CXL-attached memory profiles~\cite{cxl2024}, justifying its use as a CXL proxy.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{fig3_hardware_comparison.png}
+\caption{Bandwidth and latency profiles of DRAM and Optane DAX. The DAX tier's lower bandwidth and higher latency make it a reasonable proxy for CXL-attached memory.}
+\label{fig:hardware}
+\end{figure}  
+
+\subsection{Discussion}
+
+The hardware results (Figure~\ref{fig:hardware}) confirm that placement is worthwhile: the tiers differ enough that routing the wrong objects to far memory carries a real cost. The overhead is demonstrably small at less than 1 ns (Figure~\ref{fig:overhead}). For larger programs, as the shared library is loaded once, that cost is effectively zero. These two observations establish that the framework is a useful substrate for GC policy research.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{fig5_overhead.png}
+\caption{Per-decision dispatch overhead of the placement framework relative to stock OCaml. The \texttt{dlopen} path adds no distinguishable cost over the built-in path.}
+\label{fig:overhead}
+\end{figure}
+
+Note that GC policy is here used to refer to \textit{promotion} policy, which is an entire novel field compared to eviction policy or underlying algorithm. The lack of tiers in current memory means that GCs fundamentally do not have policies that make decisions across heterogenous heaps.
+
+Policy effectiveness is workload-dependent, as expected (Figure~\ref{fig:policies}). The \texttt{scannable} bit is a coarse MLP proxy: it captures the structural distinction between pointer-chasing and flat data, but says nothing about access frequency or fanout depth within those classes. A linked list of 1000 nodes and a single-element wrapper record are both scannable, yet their MLP profiles differ entirely. This is the natural limit of the cheap features used and motivates the implementation of more expensive features such as \texttt{chain\_depth}.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{fig1_policies_work.png}
+\caption{Wall-clock runtime under \texttt{all\_dram}, \texttt{all\_far}, and \texttt{flat\_far} placement policies. A Tier-0 policy that routes flat objects to far memory recovers measurable performance over the all-far control on pointer-chasing workloads.}
+\label{fig:policies}
+\end{figure}
+
+The compiler attributes address a complementary axis. A heuristic operates on structural facts visible at promotion time; an attribute encodes programmer intent at allocation time. The two can be composed: a policy that first checks \texttt{hint} and falls back to the \texttt{scannable} heuristic for unannotated objects gets both benefits. Because policies are independent C translation units, this composition requires no changes to the runtime. Because hints are not strict, policy developers can ignore them freely, and can decide how to counterbalance hints and features.
+
+The developer experience result is perhaps the most practical finding. A new placement hypothesis that previously required recompiling the OCaml runtime now requires writing a handful of C lines and setting an environment variable (Figure~\ref{fig:policy-code}). This lowered barrier directly enables empirical GC research: hypotheses can be tested, compared, and discarded at a rate the prior approach could not support. It also opens the door to LLM-assisted policy generation, where a language model proposes placement heuristics expressed over the \texttt{caml\_placement\_features} struct without any knowledge of the GC internals, which increases the efficacy of large context windows to be efficiently used instead of wasted on the underlying backend code that does not affect a GC policy.
+
+A funny parallel to high-frequency trading\footnote{Might be because I saw this part of HRT's codebase 6 hours before writing this section haha} can be drawn. The market and exchange are analogous to the GC backend and while we care about the data, we don't necessarily care about how it works --- just that it does. We receive data from these institutions on feeds taking known binary formats, just as the GC backend passes data to the policy via a struct. And our policy that decides where an obejct should be placed is analogous to the strategy that algorithms use to decide what to trade and how much. The reason we draw this parallel is to make the following three arguments:
 \begin{enumerate}
-  \item A garbage-collector and runtime patch to OCaml~5 implementing a
-  programmable, mechanism/policy-split object-placement framework across tiered
-  memory: two arenas, policy-driven promotion routing, per-arena accounting, a
-  frozen one-header ABI, built-in policies, and a \texttt{dlopen} loadable-policy
-  path.
-  \item A compiler front-end patch threading \texttt{[@far\_memory]} /
-  \texttt{[@main\_memory]} attributes from source through Lambda and Cmm into the
-  object header, with an \texttt{attribute} policy that honors them.
-  \item Hand-written benchmarks (pointer-chasing, array-traversal, and mixed)
-  with a memory-pressure harness, and an evaluation showing the framework is free
-  ($\sim\!2$~ns/decision, no overhead over stock OCaml) and that cheap Tier-0
-  policies recover most of the all-in-DRAM performance under pressure.
+  \item ML model based GC. Trading strategies are frequently based on deep learning models that are trained on a variety of inputs. Garbage collectors could be trained on models that take heap state as input (similar to a market where we have snapshots of orderbooks, in a GC we can have snapshots of the GC internals) and return a prediction for the most optimal placement as output. The issue with this is very high prediction latency, not prediction strength.
+  \item `Signal' based GC. Trading strategies are sometimes composed of linear combinations of a variety of signals (`features'). These are identical in architecture to the features passed to the GC. The design was somewhat inspired by the architecture from trading, as these signals are composed together similarly GC policies for this project with simple functions that are abstracted away from the GC/market internals.
+  \item The difference between trading and GC placement is that in trading, a strategy can decide to not make a trade. In a GC, the policy cannot decide to not place an object on a heap. While it can be argued that placement in DRAM can be a sensible default, that is still fundamentally not a no-op operation that \textit{not} placing an order to an exchange is.
 \end{enumerate}
+
+ML/Signal based GC is a interesting direction for future work. The complexity here is that OCaml is overly complex as a harness, but that may make the research more interesting and worthwhile. The compute-boundedness of the direction is glaringly obvious, but positive results could motivate further research into increasing the speed of embedded machine learning models. The tension is between high-latency predictions and possible performance improvements obtained from more optimal object placement.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.49\linewidth]{fig2b_trivial_policy.jpg}
+\hfill
+\includegraphics[width=0.49\linewidth]{fig2a_complex_policy_still_simple.jpg}
+\caption{Left: a trivial all-DRAM policy. Right: a more structured policy that weighs the compiler hint and arena fill level. Both are self-contained C translation units under 30 lines.}
+\label{fig:policy-code}
+\end{figure}
+
+A current limitation is that only static placement is evaluated. An object's access pattern can shift after promotion: a working-set object initially accessed frequently may become cold, while a previously cold data structure may be pulled into a hot loop. Far-to-DRAM \emph{migration} after promotion would address this, but requires whole-heap pointer fixup, equivalent to compaction. Object handles~\cite{alaska2024} would make this cheaper, and the \texttt{should\_migrate} callback slot in the policy vtable is reserved for this purpose. We leave it as future work.
 
 \section{Conclusion}
 
-Treating GC object placement as a programmable policy --- mechanism in the
-runtime, judgment in a swappable pure function --- is both cheap and effective.
-The engine defends correctness so the policy never has to, a decision costs a
-couple of nanoseconds, and the right structural policy turns a $2.4\times$
-far-memory penalty back into near-baseline performance. The framing deliberately
-trades the search for one winning heuristic for an apparatus that makes such
-heuristics cheap to write, safe to run, and easy to compare --- and leaves
-migration, richer features, and an OCaml policy DSL as ABI-ready future work.
+Managed runtimes have a structural advantage over unmanaged code in a tiered-memory world: the GC already relocates objects. OCaml~5 already promotes objects and it was trivial to \texttt{mmap} a second arena. Placement policy is difficult to engineer, as the intuitive option is to write it somewhere deep within the GC because it's unlikely the average developer will want to write custom GC policies. By pulling placement into its own software layer, ordinary developers can write placement policies that are specially tailored to their programs. Evaluation on 800~GB Optane DAX hardware shows that the overhead of dynamically loadable policies is under 1~ns.
+
+The contribution is the research infrastructure. A placement hypothesis that previously required recompiling the OCaml runtime now costs a handful of C lines and an environment variable. The same interface is amenable to LLM-assisted policy generation and to signal-based policies inspired by quantitative finance, where linear combinations of object features (size, tag, depth, hotness) serve the same role as alpha signals in a trading strategy.
+
+Several directions remain open. More convoluted features can be implemented and instrumented. Object handles~\cite{alaska2024} would unlock post-promotion migration without full-heap compaction. A higher-level policy DSL, or a machine-learned policy trained on heap snapshots, could be layered on the existing C interface without any runtime change.
+
+The most poignant direction for future work is to experiment with what policies are best for which workloads, and whether it makes sense in a production language to expect developers to write custom GC policies. The argument can be made that once a developer wants to control memory at such a granular level, they may as well just use C++. Some environments could be locked into specific programming languages, and increasing control of managed programming languages gives those developers more freedom. The conclusion is not a positive result, but establishes infrastructure to find positive results.
+
+A second direction for immediate future work accounts for the size of the DAX-based device. That device has 800 GB of addressable space, which implies that putting aside the tiered memory in GCs, even just porting a language to only use DAX-based memory in place of DRAM could mean fewer pages swapped. That would increase performance.
 
 \bibliographystyle{ACM-Reference-Format}
 \bibliography{references}
 
 \appendix
-\section{AI Usage Disclosure}
-This was a yes-AI project. Per the project's stated policy, the benchmarks were
-written by hand and not AI-generated. AI assistance (Claude) was used elsewhere
-in the engineering and in drafting this report; the author has read and reviewed
-every part of the contribution and takes responsibility for its quality and
-provenance.
+\section{AI Usage}
+AI enabled me to take on a more feature-based, ``PM-like'' role --- more concretely, AI was the code writer for this project. The observations from using AI for a large scale project are the same as those I've had working in industry: that working with AI is split into three phases. Gathering context, refining a plan, and executing that plan. From some of the logs, it can be seen that I spent a lot of time making sure the AI knew what files to read, what was going on, what the vision was, etc. Then, I would let it take free reign and write a rough draft of a plan of what it \textit{wanted} to do. The way that software is changing is that we don't necessarily care about specific code being written, but the level of detail in the plans we give to AI. The second phase is refining the plan, and this may entail overt criticality of AI's word choice, phrasing, what it chooses to focus on, etc. We as the technical overseers know what we want, and while sometimes AI gives us useful answers, ultimately we are the ones making the decisions. Sometimes, when we don't know, we may ask AI to decide for us. Usually, this is a mistake. The better solution is to ideate with AI in a conversation style, such that we maintain the unilateral decision making capability. Only once we make the plan as concrete as possible should AI be allowed to execute.
+
+In a first run through of much of this project, I did not make the plans \textit{as concrete as possible}. This led to the code being implemented to be sloppy and monolithic, whereas in the final run through that was presented, the spec was agreed upon before a single line of code was written. This is the way things should be. This is the reason that some companies require developers to write extensively and unnecessarily long design docs before handing the rest off to Claude. Not because a human will have doubt after the first 10, but because we don't want AI to have any confusion.
+
+The engineering from Claude was mediocre, to be frank. The code that was written was only good after instructing Claude to maintain high code quality standards, use sane naming, spend time thinking about names, etc. The default is to vomit everything out without even adding newlines between sections of code.
+
+If I wrote the code by hand, I would definitely be more intimately familiar with OCaml's APIs. Using AI gave me much more useful architectural level insight, which is more applicable. The applicability is because the architecture can be used pretty much anywhere, while specific lines of code are pretty useless outside of the classroom and school environment. So intro classes may not benefit much using tools like Claude as 300 and 400 levels.
+
+The paid plan was good but ultimately still had rate limits. The industry norm is to use API billing which gets expensive quickly (I've spent probably >\$300 in a single day, which can be on the low side at some companies). Ultimately the use of funds was good, but still not reflective of industry practices.
+
+One more insight both from working here and in industry is splitting work across sessions. Once sessions get long, context cache lookups get VERY expensive (I had to use my own account, and it DRAINED my credits). Splitting these sessions into multiple and sharing context via Markdown files exponentially cuts the rate at which money is spent.
+
+One side of me thinks I should have written more code by hand for this project, but then I would have less opportunity to explore higher level architectural ideas. There is a balance to strike. At work, I'm starting to write more specs by hand before handing off to Claude, specifically where I know Claude will get things wrong.
+
+As a funny example from the insights document:
+\begin{quote}
+  Asked to 'make the text white,' Claude enthusiastically built an entire env-gated dark-mode feature before the user interrupted to explain they just wanted... white text.
+\end{quote}
+To be specific and communicate ideas clearly is the challenge for the next generation of computer scientists, not writing code. For this reason and others, I regret not doing a minor in comparative literature.
+
+\section{Code Availability}
+Code can be found at \texttt{https://github.com/andrlime/ocaml}. The plan used to guide Claude Code can be found at \texttt{PLAN.md}. There are some unimplemented stretch goals described in that document.
+
+\section{Final Thoughts}
+I should probably clean this up. I think the ideas are really cool. But everything is all over the place... maybe that's a consequence of using Claude.
 
 \end{document}
